@@ -1,34 +1,34 @@
-# DESIGN.md — Abyss Multi-Agent Coding Harness & RepoOnboard
+# DESIGN.md — Modern Coding Agent Architecture Control Plane
 
-> Generated and verified with:
-> - **Component System**: `meta/astryx` (`@astryxdesign/core@0.7.16`, `@astryxdesign/theme-neutral@0.7.16`)
-> - **Web Platform Standards**: `GoogleChrome/modern-web-guidance` (v1.0.1)
-> - **Design System Database**: `nextlevelbuilder/ui-ux-pro-max-skill` (`search.py --design-system -p "Abyss Harness"`)
-> - **Layout & Anti-Slop Gates**: `Nutlope/hallmark` & `pbakaus/impeccable`
-> - **Interactive Architecture Map**: `tt-a1i/archify` (`archify-ir-3.2`)
+> Verified UI foundations:
+> - **Component System**: Meta Astryx (`@astryxdesign/core`, `@astryxdesign/theme-neutral`, locally bundled under `app/static/vendor/`)
+> - **Web Platform Standards**: Native `<dialog closedby="any">`, CSS Nesting, `AbortSignal.timeout()`, `document.startViewTransition()`, IME-safe Enter handling, accessible error announcements (`role="alert"`)
+> - **Air-Gap Pod Readiness**: 100% self-contained static assets with zero external CDN or Google Fonts requests
+> - **Interactive Architecture Map**: Layered Modern DDD graph highlighting `★ Focus Domains (guardrails · execution)`
 
 ## 1. Visual Direction & Domain Fit
-- **Domain**: AI Coding Agent Control Plane, Multi-Agent Git Worktree Orchestrator, Codebase Onboarding (`RepoOnboard`)
+- **Domain**: Modern Coding Agent Control Plane — Isolated Worktree Build & Live Preview, Read-Only Walkthrough Code Review, Deterministic Guardrails & Code Mode REPL Lab, Codebase Onboarding
 - **Style**: `Dark Mode (OLED) — Code Dark + Run Green`
 - **Aesthetic Principles**:
-  - High-density developer workspace inspired by Claude Code, OpenAI Codex, and Antigravity
-  - Zero decorative slop: no purple-to-blue hero gradients, no nested cards inside cards, no emoji icons (crisp inline SVG icons only)
-  - Clear visual separation between **[My Learning Core (User-Implemented Alignment Modules)]** and **[AI-Built Infrastructure & UI]**
+  - High-density developer workspace aligned with modern coding agent control planes (`open-swe`, Claude Code, Codex)
+  - Zero decorative slop: no purple-to-blue hero gradients, no nested cards inside cards, crisp inline SVG icons only
+  - Clear visual separation between **Focus Domains (`app/domains/guardrails/`, `app/domains/execution/`)** highlighted in Amber Gold and **Supporting Domains & Shared Kernel (`workflow`, `onboarding`, `core`)**
+  - Sandboxed Live Preview for built HTML artifacts using `<iframe sandbox="allow-scripts">` (never granting `allow-same-origin`) paired with an explicit `"새 탭으로 열기"` link
 
 ## 2. Color Tokens (Mapped to `@astryxdesign/theme-neutral` & `oklch`)
 | Token | Value | Role |
 | :--- | :--- | :--- |
-| `--surface-bg` | `#0B0F19` / `oklch(0.16 0.02 255)` | Root OLED background |
-| `--surface-panel` | `#111827` / `oklch(0.21 0.025 255)` | Primary control plane pane |
-| `--surface-elevated` | `#1B2336` / `oklch(0.25 0.03 255)` | Interactive card / worktree node |
-| `--border-hairline` | `#2A364F` | 1px structural divider |
-| `--text-primary` | `#F8FAFC` | Primary readable text (contrast > 14:1) |
-| `--text-secondary` | `#94A3B8` | Supporting metadata & file paths |
-| `--accent-run` | `#22C55E` | Run Green (Active agent / Approved / Merged) |
-| `--accent-info` | `#38BDF8` | Sky Cyan (Worktree branch / Mailbox contract) |
-| `--accent-core` | `#F59E0B` | Amber Gold (Highlights User's Learning Core modules) |
-| `--accent-danger` | `#EF4444` | Worktree Isolation Refusal / Test failure |
+| `--color-background` | `#0B0F19` / `oklch(0.16 0.02 255)` | Root OLED background |
+| `--color-surface` | `#0F172A` / `oklch(0.21 0.025 255)` | Primary control plane pane |
+| `--color-card` | `#161F33` / `oklch(0.25 0.03 255)` | Interactive card / worktree node |
+| `--color-border` | `#2A364F` | 1px structural hairline divider |
+| `--color-text-primary` | `#F8FAFC` | Primary readable text (contrast > 14:1) |
+| `--color-text-muted` | `#94A3B8` | Supporting metadata & file paths |
+| `--color-accent` | `#22C55E` | Run Green (Active agent / Approved / Merged / Passed) |
+| `--color-worktree` | `#38BDF8` | Sky Cyan (Worktree branch / Mailbox / Info) |
+| `--color-core-gold` | `#F59E0B` | Amber Gold (Focus Domains: `guardrails` & `execution`) |
+| `--color-danger` | `#EF4444` | Guardrail Refusal / `REQUEST_CHANGES` / Test failure |
 
-## 3. Typography (`ui-ux-pro-max` Recommendation)
-- **UI & Headings (`--font-family-body`, `--font-family-heading`)**: `'IBM Plex Sans'`, system-ui, sans-serif
-- **Code, Diffs, Worktree Paths, & Logs (`--font-family-code`)**: `'JetBrains Mono'`, ui-monospace, monospace
+## 3. Air-Gap Typography Stack
+- **UI & Headings (`--font-family-body`, `--font-family-heading`)**: `'IBM Plex Sans', 'Pretendard', 'Noto Sans KR', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif` (zero external font network fetches)
+- **Code, Diffs, Worktree Paths & Logs (`--font-family-code`)**: `'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace`

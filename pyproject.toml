@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "abyss-harness"
-version = "0.1.0"
-description = "2026.11 Claude Code Alignment & Multi-Agent Worktree Coding Harness (with DeepAgents & Qwen 3.8 Flash / Gemini / OpenAI Rotator)"
+name = "coding-agent-architecture"
+version = "1.0.0"
+description = "Modern Coding Agent Architecture: Deterministic Guardrails, Code Mode (REPL), Open SWE Build/Preview/Review & Internal GitLab Worktrees"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -28,7 +28,7 @@ deepagents = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["abyss*", "demo_workspace*"]
+include = ["app*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

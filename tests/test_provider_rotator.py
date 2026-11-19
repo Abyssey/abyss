@@ -1,13 +1,18 @@
 """
-Unit tests for Multi-Provider LLM Rotator (`abyss/llm/provider_rotator.py`).
-Tests role_based, round_robin, single, and fallback strategies.
+Unit tests for Multi-Provider LLM Rotator (`app/core/llm/provider_rotator.py`).
+Tests role_based, round_robin, single, fallback strategies, builder mapping, and key masking.
 """
 
-from abyss.llm.provider_rotator import LLMProviderRotator, RotationStrategy
+from __future__ import annotations
+
+from app.core.llm.provider_rotator import LLMProviderRotator
 
 
 def test_provider_rotator_strategies_and_live_reconfig() -> None:
     rotator = LLMProviderRotator()
+
+    # Default role_based mapping includes builder role
+    assert rotator.role_mapping["builder"] == "qwen"
 
     # 1. Role-based routing
     rotator.update_config(
@@ -42,7 +47,7 @@ def test_provider_rotator_strategies_and_live_reconfig() -> None:
     assert res["fallback_triggered"] is True
 
 
-def test_round_robin_rotates_across_ready_providers() -> None:
+def test_round_robin_and_api_key_masking() -> None:
     rotator = LLMProviderRotator()
     rotator.update_config(
         {
@@ -56,3 +61,7 @@ def test_round_robin_rotates_across_ready_providers() -> None:
     first = rotator.select_candidate_chain("worker-1", "worker")[0].provider_id
     second = rotator.select_candidate_chain("worker-1", "worker")[0].provider_id
     assert first != second
+
+    public_state = rotator.get_state()
+    assert "123456789" not in public_state["providers"]["qwen"]["api_key_masked"]
+    assert "..." in public_state["providers"]["qwen"]["api_key_masked"]
