@@ -65,12 +65,21 @@ def test_web_server_endpoints() -> None:
         assert "★ Focus Domain #2" in core_blob
         assert ("직접" + " 작성") not in core_blob
         assert ("숙" + "제") not in core_blob
+        assert "Bare Remote" not in core_blob
+        assert "오프라인 테스트용 로컬 원격" in core_blob
 
-        # 4. Workflow task presets endpoint
+        # 4. Workflow task presets endpoint (all 5 canonical Korean prompts verbatim)
         res_presets = client.get("/api/workflow/tasks/presets")
         assert res_presets.status_code == 200
         presets_data = res_presets.json()
         assert len(presets_data["storyline_prompts"]) == 5
+        assert [p["prompt"] for p in presets_data["storyline_prompts"]] == [
+            "이 프로젝트 구조와 핵심 파일을 한눈에 정리해줘",
+            "이 프로젝트 지도를 클릭해서 볼 수 있는 웹페이지를 만들어줘",
+            "서비스 상태를 한눈에 보는 점검 대시보드 웹페이지를 만들어줘",
+            "에이전트가 main 브랜치에 push하거나 상위 비밀 파일을 건드리지 못하게 막아줘",
+            "방금 작업한 브랜치 코드에 보안 문제나 버그가 없는지 리뷰해줘",
+        ]
         assert presets_data["build_presets"][0]["id"] == "project_map_app"
 
         # 5. Provider rotation config & test
@@ -162,3 +171,48 @@ def test_web_server_endpoints() -> None:
         answer_data = res_answer.json()
         assert answer_data["is_correct"] is True
         assert "coach_response" in answer_data
+
+
+def test_dockerfile_and_pyproject_pod_packaging_hygiene() -> None:
+    import tomllib
+
+    dockerfile_text = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "GIT_TERMINAL_PROMPT=0" in dockerfile_text
+    assert "GCM_INTERACTIVE=never" in dockerfile_text
+    assert "PYTHONPATH=/app" in dockerfile_text
+    assert "exec uvicorn app.main:app" in dockerfile_text
+    assert "USER appuser" in dockerfile_text
+    assert "HEALTHCHECK" in dockerfile_text
+
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    pkg_data = pyproject["tool"]["setuptools"]["package-data"]["app"]
+    assert "static/*" in pkg_data
+    assert "static/**/*" in pkg_data
+
+
+def test_frontend_edge_cases_custom_chip_preview_reset_and_beginner_copy() -> None:
+    import shutil
+    import subprocess
+
+    html_text = (REPO_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    js_text = (REPO_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    css_text = (REPO_ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert 'data-build-preset="custom"' in html_text
+    assert "직접 입력 (custom)" in html_text
+    assert "custom:" in js_text
+    assert "iframe.removeAttribute('src')" in js_text
+    assert "iframe.removeAttribute('srcdoc')" in js_text
+    assert "if (state.dashboard)" in js_text
+    assert "--color-accent-Soft" not in css_text
+    assert "--color-accent-Soft" not in js_text
+
+    node_bin = shutil.which("node")
+    if node_bin:
+        proc = subprocess.run(
+            [node_bin, "--check", str(REPO_ROOT / "app" / "static" / "app.js")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr

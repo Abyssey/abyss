@@ -99,6 +99,7 @@ async def build_coding_task(
             repo_url_or_path=req.repo_url_or_path,
             instruction=req.instruction,
             preset=req.preset,
+            base_branch=req.base_branch,
             use_code_mode=req.use_code_mode,
             push_to_remote=req.push_to_remote,
         )
@@ -142,5 +143,7 @@ async def preview_built_artifact(
         headers={
             "Cache-Control": "no-store",
             "X-Worktree-Branch": branch_name,
+            "Content-Security-Policy": "sandbox allow-scripts",
+            "X-Content-Type-Options": "nosniff",
         },
     )

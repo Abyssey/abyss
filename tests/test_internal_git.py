@@ -293,3 +293,89 @@ def test_onboarding_api_self_modern_ddd_layers_and_internal_origin_and_pod_probe
         bare_data = res_bare.json()
         assert bare_data["analysis"]["source_type"] == "internal_git_bare"
         assert bare_data["analysis"]["total_files"] >= 3
+
+
+def test_unset_gitlab_url_never_leaks_token_to_external_host(tmp_path: Path) -> None:
+    settings = _make_settings(
+        tmp_path,
+        internal_gitlab_url="",
+        internal_gitlab_token="fake-token-secret-123",
+    )
+    resolver = InternalGitSourceResolver(settings)
+    env_external = resolver.build_git_env("https://evil.example/repo.git")
+    assert "GIT_CONFIG_COUNT" not in env_external
+
+    env_internal = resolver.build_git_env("https://gitlab.internal/team/repo.git")
+    assert env_internal.get("GIT_CONFIG_COUNT") == "1"
+
+
+def test_sanitize_git_text_redacts_raw_base64_token() -> None:
+    secret = "fake-token-RawBase64LeakToken99"
+    raw_b64 = base64.b64encode(secret.encode("utf-8")).decode("ascii")
+    cleaned = sanitize_git_text(f"leak={raw_b64}", secrets=(secret,))
+    assert raw_b64 not in cleaned
+    assert "***" in cleaned
+
+
+def test_trailing_crlf_token_crlf_and_short_path_traversal_refused(tmp_path: Path) -> None:
+    settings = _make_settings(
+        tmp_path,
+        internal_gitlab_url="https://gitlab.corp.local",
+        internal_gitlab_token="fake-token-valid-token",
+    )
+    resolver = InternalGitSourceResolver(settings)
+
+    with pytest.raises(InternalGitSourceError):
+        resolver.resolve("https://gitlab.corp.local/team/repo.git\r\n")
+
+    with pytest.raises(InternalGitSourceError):
+        resolver.resolve("team/../../etc/passwd")
+
+    bad_token_settings = _make_settings(
+        tmp_path,
+        internal_gitlab_url="https://gitlab.corp.local",
+        internal_gitlab_token="fake-token-bad\r\nX-Injected: 1",
+    )
+    bad_resolver = InternalGitSourceResolver(bad_token_settings)
+    with pytest.raises(InternalGitSourceError):
+        bad_resolver.build_git_env("https://gitlab.corp.local/team/repo.git")
+
+
+@pytest.mark.asyncio
+async def test_onboarding_answer_reanalyzes_when_repo_changes(tmp_path: Path) -> None:
+    other_dir = tmp_path / "other_service_app"
+    other_dir.mkdir()
+    (other_dir / "worker.py").write_text(
+        '"""Isolated payment worker."""\nclass PaymentWorker:\n    def run(self) -> int:\n        return 1\n',
+        encoding="utf-8",
+    )
+    settings = _make_settings(tmp_path)
+    svc = OnboardingService(settings=settings)
+
+    pkg_self = await svc.analyze("self")
+    assert pkg_self["repo_name"] == settings.repo_root.name
+
+    # Evaluate answer targeting `other_dir` directly without calling analyze(other_dir) first:
+    # must auto-analyze `other_dir` on cache miss instead of grading against stale `self`
+    other_key = svc._cache_key(str(other_dir))
+    assert other_key not in svc._cached_packages
+    res_other = await svc.evaluate_answer(
+        repo_url_or_path=str(other_dir),
+        question_id="q1_entry",
+        selected_index=0,
+    )
+    assert other_key in svc._cached_packages
+    assert svc._cached_packages[other_key]["repo_name"] == "other_service_app"
+    assert isinstance(res_other["is_correct"], bool)
+
+    # Also verify exact grading against `other_dir` even after switching active repo back to `self`
+    other_q = svc._cached_packages[other_key]["socratic_ladder"][0]
+    await svc.analyze("self")
+    assert svc._last_cache_key == svc._cache_key("self")
+    res_exact = await svc.evaluate_answer(
+        repo_url_or_path=str(other_dir),
+        question_id=other_q["id"],
+        selected_index=other_q["correct_index"],
+    )
+    assert res_exact["is_correct"] is True
+    assert "worker.py" in res_exact["source_evidence"] or "other_service_app" in svc._cached_packages[other_key]["repo_name"]

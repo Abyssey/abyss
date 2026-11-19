@@ -19,11 +19,12 @@ class BuildTaskRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     repo_url_or_path: str = "demo"
-    instruction: str = "이 프로젝트 구조 한눈에 보는 인터랙티브 웹 페이지 만들어줘"
+    instruction: str = "이 프로젝트 지도를 클릭해서 볼 수 있는 웹페이지를 만들어줘"
     preset: Literal["project_map_app", "inspection_dashboard", "custom"] = Field(
         default="project_map_app",
         validation_alias=AliasChoices("preset", "preset_id"),
     )
+    base_branch: str = "main"
     use_code_mode: bool = False
     push_to_remote: bool = True
 

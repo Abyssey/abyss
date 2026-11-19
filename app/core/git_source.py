@@ -47,12 +47,21 @@ _URL_USERINFO_RE = re.compile(r"(https?://)[^/\s@]+@")
 _AUTH_HEADER_RE = re.compile(r"(?i)(Authorization:\s*(?:Basic|Bearer)\s+)\S+")
 _PRIVATE_TOKEN_RE = re.compile(r"(?i)(PRIVATE-TOKEN:\s*)\S+")
 _GLPAT_RE = re.compile(r"\bfake-token-[A-Za-z0-9_-]{6,}\b")
-_SHORT_GITLAB_PATH_RE = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$")
+_SHORT_GITLAB_PATH_RE = re.compile(
+    r"^(?!.*\.\.)[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)+$"
+)
 _PUBLIC_GIT_HOSTS = frozenset({"github.com", "gitlab.com", "bitbucket.org"})
 
 
 class InternalGitSourceError(ValueError):
     """Raised when a Git source target cannot be validated, resolved, or cloned safely."""
+
+
+def _assert_no_control_chars(value: str, label: str) -> None:
+    if any(ch in value for ch in ("\r", "\n", "\x00")):
+        raise InternalGitSourceError(
+            f"안전하지 않은 제어 문자(CRLF/NULL)가 {label}에 포함되어 거부되었습니다."
+        )
 
 
 def sanitize_git_text(text: str, secrets: Iterable[str] = ()) -> str:
@@ -63,14 +72,13 @@ def sanitize_git_text(text: str, secrets: Iterable[str] = ()) -> str:
     for secret in secrets:
         if not secret:
             continue
-        sanitized = sanitized.replace(secret, "***")
         encoded_oauth = base64.b64encode(f"oauth2:{secret}".encode("utf-8")).decode("ascii")
-        sanitized = sanitized.replace(encoded_oauth, "***")
         encoded_colon = base64.b64encode(f":{secret}".encode("utf-8")).decode("ascii")
-        sanitized = sanitized.replace(encoded_colon, "***")
+        encoded_raw = base64.b64encode(secret.encode("utf-8")).decode("ascii")
         url_quoted = quote(secret, safe="")
-        if url_quoted != secret:
-            sanitized = sanitized.replace(url_quoted, "***")
+        candidates = {secret, encoded_oauth, encoded_colon, encoded_raw, url_quoted}
+        for cand in sorted((c for c in candidates if c), key=len, reverse=True):
+            sanitized = sanitized.replace(cand, "***")
     sanitized = _URL_USERINFO_RE.sub(r"\1***@", sanitized)
     sanitized = _AUTH_HEADER_RE.sub(r"\1***", sanitized)
     sanitized = _PRIVATE_TOKEN_RE.sub(r"\1***", sanitized)
@@ -79,11 +87,8 @@ def sanitize_git_text(text: str, secrets: Iterable[str] = ()) -> str:
 
 
 def _validate_safe_arg(value: str, label: str = "target") -> str:
+    _assert_no_control_chars(value, label)
     cleaned = value.strip()
-    if any(ch in cleaned for ch in ("\r", "\n", "\x00")):
-        raise InternalGitSourceError(
-            f"안전하지 않은 제어 문자(CRLF/NULL)가 {label}에 포함되어 거부되었습니다."
-        )
     if cleaned.startswith("-"):
         raise InternalGitSourceError(
             f"'-'로 시작하는 {label}은 Git CLI 옵션 주입 방지를 위해 허용되지 않습니다."
@@ -105,18 +110,35 @@ def _strip_url_userinfo(url: str) -> str:
 def _is_private_or_internal_host(hostname: str | None) -> bool:
     if not hostname:
         return False
-    low = hostname.lower()
+    low = hostname.strip().rstrip(".").lower()
+    if not low:
+        return False
     if low in ("localhost", "host.docker.internal") or low.endswith(
-        (".local", ".internal", ".corp", ".lan", ".intranet")
+        (
+            ".local",
+            ".internal",
+            ".corp",
+            ".lan",
+            ".intranet",
+            ".home.arpa",
+            ".svc",
+            ".cluster.local",
+        )
     ):
         return True
-    if "gitlab" in low and low != "gitlab.com":
-        return True
     try:
-        ip = ipaddress.ip_address(low)
-        return ip.is_private or ip.is_loopback or ip.is_link_local
+        ip = ipaddress.ip_address(low.strip("[]"))
+        return (
+            (ip.is_private or ip.is_loopback or ip.is_link_local)
+            and not ip.is_unspecified
+            and not ip.is_multicast
+        )
     except ValueError:
-        return False
+        pass
+    # Single-label internal hostname (e.g., `gitlab`, `git-server` inside K8s/Docker VPC)
+    if "." not in low and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", low):
+        return True
+    return False
 
 
 def _repo_name_from_url(url: str) -> str:
@@ -175,6 +197,8 @@ class InternalGitSourceResolver:
 
         if self.settings.internal_gitlab_url:
             cfg_parsed = urlsplit(self.settings.internal_gitlab_url)
+            if not cfg_parsed.scheme or not cfg_parsed.hostname:
+                return False
             cfg_port = cfg_parsed.port or (443 if cfg_parsed.scheme.lower() == "https" else 80)
             target_port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
             return (
@@ -183,13 +207,22 @@ class InternalGitSourceResolver:
                 and target_port == cfg_port
             )
 
-        return parsed.hostname.lower() not in _PUBLIC_GIT_HOSTS
+        return _is_private_or_internal_host(parsed.hostname)
 
     def build_git_env(self, remote_url: str | None = None) -> dict[str, str]:
         """
         Build a non-interactive Git subprocess environment using Git 2.31+
         `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` env variables.
         """
+        if remote_url:
+            _assert_no_control_chars(remote_url, "원격 저장소 URL")
+        if self.settings.internal_gitlab_token:
+            _assert_no_control_chars(self.settings.internal_gitlab_token, "INTERNAL_GITLAB_TOKEN")
+        if self.settings.internal_git_ca_bundle:
+            _assert_no_control_chars(
+                self.settings.internal_git_ca_bundle, "INTERNAL_GIT_CA_BUNDLE"
+            )
+
         env = os.environ.copy()
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GCM_INTERACTIVE"] = "never"
@@ -232,6 +265,8 @@ class InternalGitSourceResolver:
         if configs:
             env["GIT_CONFIG_COUNT"] = str(len(configs))
             for idx, (cfg_key, cfg_val) in enumerate(configs):
+                _assert_no_control_chars(cfg_key, "GIT_CONFIG_KEY")
+                _assert_no_control_chars(cfg_val, "GIT_CONFIG_VALUE")
                 env[f"GIT_CONFIG_KEY_{idx}"] = cfg_key
                 env[f"GIT_CONFIG_VALUE_{idx}"] = cfg_val
 
@@ -239,12 +274,10 @@ class InternalGitSourceResolver:
 
     def resolve_target_spec(self, target: str) -> tuple[str, SourceType, str]:
         """Classify and normalize a target alias, local path, bare remote, or GitLab URL."""
-        raw = (target or "").strip()
-        if not raw or raw in (".", "self", "app", "abyss", "niisow/abyss"):
+        cleaned = _validate_safe_arg(target or "", label="저장소 경로/URL")
+        if not cleaned or cleaned in (".", "self", "app", "abyss", "niisow/abyss"):
             root = self.settings.repo_root.resolve()
             return str(root), "local_path", f"local:{root.name}"
-
-        cleaned = _validate_safe_arg(raw, label="저장소 경로/URL")
 
         if cleaned == "demo":
             ws = self.settings.demo_workspace.resolve()
@@ -293,7 +326,11 @@ class InternalGitSourceResolver:
             return str(candidate), "local_path", str(candidate)
 
         # Internal GitLab shorthand like `team/service-repo` when INTERNAL_GITLAB_URL is configured
-        if self.settings.internal_gitlab_url and _SHORT_GITLAB_PATH_RE.fullmatch(cleaned):
+        if (
+            self.settings.internal_gitlab_url
+            and _SHORT_GITLAB_PATH_RE.fullmatch(cleaned)
+            and not any(seg in (".", "..") or ".." in seg for seg in cleaned.split("/"))
+        ):
             base = self.settings.internal_gitlab_url.rstrip("/")
             slug = cleaned.removesuffix(".git")
             url = f"{base}/{slug}.git"

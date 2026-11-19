@@ -58,7 +58,7 @@ class HandoffArtifact:
     role: str
     worktree_branch: str
     summary: str
-    context_strategy: ContextStrategy = "reset_handoff"
+    context_strategy: ContextStrategy = "compaction"
     compaction_events: int = 0
     reasoning_trace: list[str] = field(default_factory=list)
     files_touched: list[str] = field(default_factory=list)
@@ -102,7 +102,7 @@ class AgentRuntime:
     - OpenAI 호환 엔드포인트(사내 Qwen 3.8 Flash, Gemini, OpenAI, Mock)와 통신
     - 추론 모델의 `<think>...</think>` 블록 자동 분리 추출
     - 매 도구 실행 전 `WorktreeIsolationPolicy` 4대 가드레일 (+ 선택적 `PermissionRules`) 강제 적용
-    - `context_strategy` ("compaction" vs "reset_handoff") 지원
+    - `context_strategy` ("compaction" 기본값 vs "reset_handoff" 선택 인계 모드) 지원
     """
 
     _THINK_REGEX = re.compile(r"<think>(.*?)</think>", re.DOTALL)
@@ -119,9 +119,10 @@ class AgentRuntime:
         max_steps: int = 12,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
         code_mode: CodeModeExecutor | None = None,
-        context_strategy: ContextStrategy = "reset_handoff",
+        context_strategy: ContextStrategy = "compaction",
         permissions: PermissionRules | None = None,
         compaction_message_limit: int = 10,
+        ask_handler: Callable[[dict[str, Any]], bool] | None = None,
     ) -> None:
         self.agent_id = agent_id
         self.role = role
@@ -133,6 +134,7 @@ class AgentRuntime:
             main_checkout_root=self.main_checkout_root,
         )
         self.permissions = permissions
+        self.ask_handler = ask_handler
         self.context_strategy: ContextStrategy = context_strategy
         self.compaction_message_limit = max(6, compaction_message_limit)
         self.tools_registry = tools_registry
@@ -169,6 +171,43 @@ class AgentRuntime:
         cleaned = cls._THINK_REGEX.sub("", raw_text).strip()
         return thoughts, cleaned
 
+    def _normalize_target_for_permissions(self, raw_target: str) -> str:
+        if not raw_target or "\x00" in raw_target:
+            return raw_target
+        p = Path(raw_target)
+        resolved = (self.worktree_root / p).resolve() if not p.is_absolute() else p.resolve()
+        if resolved.is_relative_to(self.worktree_root):
+            rel = resolved.relative_to(self.worktree_root).as_posix()
+            return rel or "."
+        return resolved.as_posix()
+
+    def _check_permission(
+        self, perm_tool: str, subject: str, args: dict[str, Any]
+    ) -> PolicyVerdict | None:
+        if self.permissions is None:
+            return None
+        perm = self.permissions.evaluate(perm_tool, subject)
+        if perm.decision == "deny":
+            return PolicyVerdict(
+                allowed=False,
+                check_name="permission_deny",
+                reason=perm.reason,
+                remediation_hint=f"{perm_tool} 호출이 권한 규칙({perm.rule})에 의해 차단되었습니다.",
+            )
+        if perm.decision == "ask":
+            payload = {"tool_name": perm_tool, "tool_input": args, "rule": perm.rule}
+            approved = bool(self.ask_handler(payload)) if self.ask_handler else False
+            if not approved:
+                return PolicyVerdict(
+                    allowed=False,
+                    check_name="permission_ask",
+                    reason=(
+                        f"{perm.reason} — no approver in this unattended session, so the call is refused."
+                    ),
+                    remediation_hint="사전 승인(ask_handler)이 없는 비대화형 세션에서는 ask 규칙 호출이 차단됩니다.",
+                )
+        return None
+
     def _verify_tool_isolation(
         self, tool_name: str, args: dict[str, Any]
     ) -> PolicyVerdict:
@@ -184,30 +223,35 @@ class AgentRuntime:
 
         if tool_name in ("write_file", "edit_file", "delete_file"):
             target = str(args.get("path") or args.get("file_path") or "")
-            if self.permissions is not None:
-                perm_tool = "Write" if tool_name == "write_file" else "Edit"
-                perm = self.permissions.evaluate(perm_tool, target)
-                if perm.decision == "deny":
-                    return PolicyVerdict(
-                        allowed=False,
-                        check_name="permission_deny",
-                        reason=perm.reason,
-                        remediation_hint="민감 파일(.env 등) 수정이 권한 규칙에 의해 차단되었습니다.",
-                    )
+            norm_target = self._normalize_target_for_permissions(target)
+            perm_tool = "Write" if tool_name == "write_file" else "Edit"
+            perm_verdict = self._check_permission(perm_tool, norm_target, args)
+            if perm_verdict is not None:
+                return perm_verdict
             return self.policy.validate_file_edit(target)
+
+        if tool_name == "read_file":
+            target = str(args.get("path") or args.get("file_path") or "")
+            norm_target = self._normalize_target_for_permissions(target)
+            perm_verdict = self._check_permission("Read", norm_target, args)
+            if perm_verdict is not None:
+                return perm_verdict
+            return self.policy.validate_file_read(target)
+
+        if tool_name == "list_files":
+            target = str(args.get("subdir") or args.get("directory") or args.get("path") or ".")
+            norm_target = self._normalize_target_for_permissions(target)
+            perm_verdict = self._check_permission("Glob", norm_target, args)
+            if perm_verdict is not None:
+                return perm_verdict
+            return self.policy.validate_file_read(target)
 
         if tool_name == "run_command":
             command = str(args.get("command", ""))
             cwd = args.get("cwd")
-            if self.permissions is not None:
-                perm = self.permissions.evaluate("Bash", command)
-                if perm.decision == "deny":
-                    return PolicyVerdict(
-                        allowed=False,
-                        check_name="permission_deny",
-                        reason=perm.reason,
-                        remediation_hint="복합 명령 세그먼트 중 금지된 규칙(예: git push)이 감지되어 차단되었습니다.",
-                    )
+            perm_verdict = self._check_permission("Bash", command, args)
+            if perm_verdict is not None:
+                return perm_verdict
             return self.policy.validate_shell_command(command=command, cwd=cwd)
 
         return PolicyVerdict(

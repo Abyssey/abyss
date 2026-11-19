@@ -18,6 +18,10 @@ const BUILD_PRESETS = {
     instruction: '서비스 상태를 한눈에 보는 점검 대시보드 웹페이지를 만들어줘',
     label: '서비스 점검 대시보드',
   },
+  custom: {
+    instruction: '현재 저장소 파일 목록을 필터링해 보여주는 웹페이지를 만들어줘',
+    label: '직접 입력 (custom)',
+  },
 };
 
 const state = {
@@ -131,6 +135,9 @@ function selectBuildPreset(presetId) {
   const textarea = document.getElementById('build-instruction-input');
   if (textarea) {
     textarea.value = cfg.instruction;
+    if (presetId === 'custom') {
+      textarea.focus();
+    }
   }
 }
 
@@ -277,7 +284,7 @@ function renderBuildTaskResult() {
   statusBadge.setAttribute('data-tone', res.status === 'completed' ? 'success' : 'danger');
 
   if (jumpBtn) {
-    jumpBtn.style.display = 'inline-flex';
+    jumpBtn.style.display = res.branch_name ? 'inline-flex' : 'none';
   }
 
   document.getElementById('build-result-meta').innerHTML = `
@@ -307,11 +314,21 @@ function renderBuildTaskResult() {
   // Embedded Live Preview (`sandbox="allow-scripts"` opaque origin only)
   const iframe = document.getElementById('build-live-preview-iframe');
   const link = document.getElementById('build-live-preview-link');
-  if (res.preview_url && iframe && link) {
-    iframe.setAttribute('sandbox', 'allow-scripts');
-    iframe.src = res.preview_url;
-    link.href = res.preview_url;
-    link.style.display = 'inline-flex';
+  if (iframe && link) {
+    if (res.preview_url) {
+      iframe.setAttribute('sandbox', 'allow-scripts');
+      iframe.removeAttribute('srcdoc'); // Critical: HTML5 srcdoc overrides src if left set
+      iframe.src = res.preview_url;
+      iframe.style.display = 'block';
+      link.href = res.preview_url;
+      link.style.display = 'inline-flex';
+    } else {
+      iframe.removeAttribute('src');
+      iframe.srcdoc = '';
+      iframe.style.display = 'none';
+      link.href = '#';
+      link.style.display = 'none';
+    }
   }
 }
 
@@ -331,9 +348,11 @@ async function runBuildTask(overrides = {}) {
     selectBuildPreset(overrides.preset);
   }
   const repoUrlOrPath = (overrides.repo_url_or_path ?? repoInput?.value ?? 'demo').trim() || 'demo';
+  const fallbackInstruction =
+    BUILD_PRESETS[preset]?.instruction || BUILD_PRESETS.project_map_app.instruction;
   const instruction =
-    (overrides.instruction ?? instInput?.value ?? BUILD_PRESETS.project_map_app.instruction).trim() ||
-    BUILD_PRESETS.project_map_app.instruction;
+    (overrides.instruction ?? instInput?.value ?? fallbackInstruction).trim() ||
+    fallbackInstruction;
   const pushToRemote = overrides.push_to_remote ?? Boolean(pushCb?.checked);
   const useCodeMode = overrides.use_code_mode ?? Boolean(cmCb?.checked);
 
@@ -768,7 +787,7 @@ function renderOnboardAndArchify() {
 
         const fb = document.getElementById(`feedback-${qid}`);
         fb.style.display = 'block';
-        fb.style.background = res.is_correct ? 'var(--color-accent-Soft)' : 'var(--color-danger-soft)';
+        fb.style.background = res.is_correct ? 'var(--color-accent-soft)' : 'var(--color-danger-soft)';
         fb.style.color = res.is_correct ? 'var(--color-accent)' : '#fca5a5';
         fb.innerHTML = `<strong>${escapeHtml(res.coach_response)}</strong><br/><span style="color: var(--color-text-secondary);">Follow-up: ${escapeHtml(res.follow_up_prompt)}</span>`;
       } catch (err) {
@@ -1190,83 +1209,133 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   });
 
-  // Quick rotation dropdowns in header
-  document.getElementById('strategy-select').addEventListener('change', async (e) => {
-    const res = await apiFetch('/api/providers/config', {
-      method: 'POST',
-      body: JSON.stringify({ strategy: e.target.value }),
-    });
-    state.dashboard.rotator = res.rotator;
-    renderWorktreesAndTasks();
+  // Quick rotation dropdowns in header (guarded with try/catch & state.dashboard null check)
+  document.getElementById('strategy-select')?.addEventListener('change', async (e) => {
+    const runBadge = document.getElementById('run-status-badge');
+    try {
+      const res = await apiFetch('/api/providers/config', {
+        method: 'POST',
+        body: JSON.stringify({ strategy: e.target.value }),
+      });
+      if (state.dashboard) {
+        state.dashboard.rotator = res.rotator;
+        renderWorktreesAndTasks();
+      }
+    } catch (err) {
+      if (runBadge) {
+        runBadge.textContent = `PROVIDER CONFIG ERROR: ${err.message}`;
+        runBadge.setAttribute('data-tone', 'danger');
+      }
+    }
   });
 
-  document.getElementById('single-provider-select').addEventListener('change', async (e) => {
-    const res = await apiFetch('/api/providers/config', {
-      method: 'POST',
-      body: JSON.stringify({ active_single_provider: e.target.value }),
-    });
-    state.dashboard.rotator = res.rotator;
-    renderWorktreesAndTasks();
+  document.getElementById('single-provider-select')?.addEventListener('change', async (e) => {
+    const runBadge = document.getElementById('run-status-badge');
+    try {
+      const res = await apiFetch('/api/providers/config', {
+        method: 'POST',
+        body: JSON.stringify({ active_single_provider: e.target.value }),
+      });
+      if (state.dashboard) {
+        state.dashboard.rotator = res.rotator;
+        renderWorktreesAndTasks();
+      }
+    } catch (err) {
+      if (runBadge) {
+        runBadge.textContent = `PROVIDER CONFIG ERROR: ${err.message}`;
+        runBadge.setAttribute('data-tone', 'danger');
+      }
+    }
   });
 
   // Native <dialog> modal controls
   const modal = document.getElementById('provider-modal');
-  document.getElementById('open-provider-modal-btn').addEventListener('click', () => modal.showModal());
-  document.getElementById('close-provider-modal-btn').addEventListener('click', () => modal.close());
+  document.getElementById('open-provider-modal-btn')?.addEventListener('click', () => modal?.showModal());
+  document.getElementById('close-provider-modal-btn')?.addEventListener('click', () => modal?.close());
 
   document.querySelectorAll('.test-provider-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
-      const pid = btn.getAttribute('data-provider');
+      const pid = btn.getAttribute('data-provider') || 'mock';
       const fb = document.getElementById('provider-test-feedback');
-      fb.textContent = `Testing connection to '${pid}'...`;
-      await saveModalSettings(false);
-      const res = await apiFetch(`/api/providers/test/${pid}`, { method: 'POST' });
-      fb.style.color = res.ok ? 'var(--color-accent)' : 'var(--color-danger)';
-      fb.textContent = `[${pid.toUpperCase()}] ${res.message}`;
+      btn.disabled = true;
+      try {
+        if (fb) {
+          fb.style.color = 'var(--color-text-secondary)';
+          fb.textContent = `Testing connection to '${pid}'...`;
+        }
+        const saved = await saveModalSettings(false);
+        if (!saved) return;
+        const res = await apiFetch(`/api/providers/test/${pid}`, { method: 'POST' });
+        if (fb) {
+          fb.style.color = res.ok ? 'var(--color-accent)' : 'var(--color-danger)';
+          fb.textContent = `[${pid.toUpperCase()}] ${res.message}`;
+        }
+      } catch (err) {
+        if (fb) {
+          fb.style.color = 'var(--color-danger)';
+          fb.textContent = `[${pid.toUpperCase()}] 연결 테스트 실패: ${err.message}`;
+        }
+      } finally {
+        btn.disabled = false;
+      }
     });
   });
 
   async function saveModalSettings(closeAfter = true) {
-    const workerRole = document.getElementById('role-map-worker').value;
-    const payload = {
-      strategy: document.getElementById('strategy-select').value,
-      active_single_provider: document.getElementById('single-provider-select').value,
-      role_mapping: {
-        lead: document.getElementById('role-map-lead').value,
-        builder: workerRole,
-        'worker-analyzer': workerRole,
-        'worker-tutor': workerRole,
-        'worker-web': workerRole,
-        reviewer: document.getElementById('role-map-reviewer').value,
-      },
-      providers: {
-        qwen: {
-          base_url: document.getElementById('qwen-base-url').value,
-          model: document.getElementById('qwen-model').value,
-          api_key: document.getElementById('qwen-api-key').value,
+    const fb = document.getElementById('provider-test-feedback');
+    try {
+      const workerRole = document.getElementById('role-map-worker').value;
+      const payload = {
+        strategy: document.getElementById('strategy-select').value,
+        active_single_provider: document.getElementById('single-provider-select').value,
+        role_mapping: {
+          lead: document.getElementById('role-map-lead').value,
+          builder: workerRole,
+          'worker-analyzer': workerRole,
+          'worker-tutor': workerRole,
+          'worker-web': workerRole,
+          reviewer: document.getElementById('role-map-reviewer').value,
         },
-        gemini: {
-          base_url: document.getElementById('gemini-base-url').value,
-          model: document.getElementById('gemini-model').value,
-          api_key: document.getElementById('gemini-api-key').value,
+        providers: {
+          qwen: {
+            base_url: document.getElementById('qwen-base-url').value,
+            model: document.getElementById('qwen-model').value,
+            api_key: document.getElementById('qwen-api-key').value,
+          },
+          gemini: {
+            base_url: document.getElementById('gemini-base-url').value,
+            model: document.getElementById('gemini-model').value,
+            api_key: document.getElementById('gemini-api-key').value,
+          },
+          openai: {
+            base_url: document.getElementById('openai-base-url').value,
+            model: document.getElementById('openai-model').value,
+            api_key: document.getElementById('openai-api-key').value,
+          },
         },
-        openai: {
-          base_url: document.getElementById('openai-base-url').value,
-          model: document.getElementById('openai-model').value,
-          api_key: document.getElementById('openai-api-key').value,
-        },
-      },
-    };
-    const res = await apiFetch('/api/providers/config', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
-    state.dashboard.rotator = res.rotator;
-    renderWorktreesAndTasks();
-    if (closeAfter) modal.close();
+      };
+      const res = await apiFetch('/api/providers/config', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      if (state.dashboard) {
+        state.dashboard.rotator = res.rotator;
+        renderWorktreesAndTasks();
+      }
+      if (closeAfter) modal?.close();
+      return true;
+    } catch (err) {
+      if (fb) {
+        fb.style.color = 'var(--color-danger)';
+        fb.textContent = `설정 저장 실패: ${err.message}`;
+      }
+      return false;
+    }
   }
 
-  document.getElementById('save-provider-config-btn').addEventListener('click', () => saveModalSettings(true));
+  document.getElementById('save-provider-config-btn')?.addEventListener('click', () => {
+    void saveModalSettings(true);
+  });
 
   // Mode 3: Run Parallel 3-Worktree Team Build & Merge
   const runBtn = document.getElementById('run-workflow-btn');

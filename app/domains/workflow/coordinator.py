@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -127,7 +128,10 @@ class MultiAgentTeamCoordinator:
         self.engine_mode: str = "agent_runtime"  # "agent_runtime" | "deepagents"
         self.is_running: bool = False
         self.last_status: str = "idle"
-        self._listeners: list[asyncio.Queue[dict[str, Any]]] = []
+        self._event_lock = threading.Lock()
+        self._listeners: list[
+            tuple[asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop | None]
+        ] = []
 
         self._ensure_base_package()
         if self.bare_remote_path is not None:
@@ -194,19 +198,33 @@ class MultiAgentTeamCoordinator:
 
     def subscribe_events(self) -> asyncio.Queue[dict[str, Any]]:
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._listeners.append(q)
+        try:
+            loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        with self._event_lock:
+            self._listeners.append((q, loop))
         return q
 
     def unsubscribe_events(self, q: asyncio.Queue[dict[str, Any]]) -> None:
-        if q in self._listeners:
-            self._listeners.remove(q)
+        with self._event_lock:
+            self._listeners = [(lq, lp) for lq, lp in self._listeners if lq is not q]
 
     def emit_event(self, event: dict[str, Any]) -> None:
         enriched = {"timestamp": time.time(), **event}
-        self.event_stream.append(enriched)
-        for q in list(self._listeners):
+        with self._event_lock:
+            self.event_stream.append(enriched)
+            listeners = list(self._listeners)
+        try:
+            current_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        for q, loop in listeners:
             try:
-                q.put_nowait(enriched)
+                if loop is not None and not loop.is_closed() and loop is not current_loop:
+                    loop.call_soon_threadsafe(q.put_nowait, enriched)
+                else:
+                    q.put_nowait(enriched)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -355,7 +373,7 @@ class MultiAgentTeamCoordinator:
                             "function": {
                                 "name": "run_command",
                                 "arguments": json.dumps(
-                                    {"command": f"pytest {test_path} -q"}
+                                    {"command": f"pytest -p no:cacheprovider {test_path} -q"}
                                 ),
                             },
                         },
@@ -418,6 +436,7 @@ class MultiAgentTeamCoordinator:
             tools_schema=schemas,
             max_steps=8,
             event_callback=self.emit_event,
+            context_strategy="reset_handoff",
         )
 
         scripted_responder = self._build_worker_scripted_responder(
@@ -641,8 +660,9 @@ class MultiAgentTeamCoordinator:
                 test_file = t.target_files[1]
                 env = os.environ.copy()
                 env["PYTHONPATH"] = str(wt_info.worktree_path)
+                env["PYTHONDONTWRITEBYTECODE"] = "1"
                 pytest_proc = subprocess.run(
-                    [sys.executable, "-m", "pytest", test_file, "-v"],
+                    [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", test_file, "-v"],
                     cwd=str(wt_info.worktree_path),
                     env=env,
                     capture_output=True,
@@ -707,8 +727,9 @@ class MultiAgentTeamCoordinator:
 
             main_env = os.environ.copy()
             main_env["PYTHONPATH"] = str(self.workspace_root)
+            main_env["PYTHONDONTWRITEBYTECODE"] = "1"
             final_pytest = subprocess.run(
-                [sys.executable, "-m", "pytest", "tests", "-q"],
+                [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "tests", "-q"],
                 cwd=str(self.workspace_root),
                 env=main_env,
                 capture_output=True,

@@ -231,3 +231,127 @@ def test_agent_runtime_with_code_mode_and_compaction_strategy(tmp_path: Path) ->
     assert len(artifact.tool_history) == 1
     assert artifact.tool_history[0].tool_name == "REPL"
     assert artifact.files_touched == ["src/retry_policy.py"]
+
+
+def test_agent_runtime_and_handoff_default_context_strategy_is_compaction() -> None:
+    import inspect
+    from app.domains.execution.runtime import HandoffArtifact
+
+    sig = inspect.signature(AgentRuntime.__init__)
+    assert sig.parameters["context_strategy"].default == "compaction"
+
+    default_artifact = HandoffArtifact(
+        agent_id="a1",
+        role="worker",
+        worktree_branch="agent/a1",
+        summary="done",
+    )
+    assert default_artifact.context_strategy == "compaction"
+
+    reset_artifact = HandoffArtifact(
+        agent_id="a2",
+        role="worker",
+        worktree_branch="agent/a2",
+        summary="done",
+        context_strategy="reset_handoff",
+    )
+    assert reset_artifact.context_strategy == "reset_handoff"
+
+
+def test_code_mode_blocks_str_format_globals_secret_exfiltration(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("INTERNAL_GITLAB_TOKEN", "CANARY_LEAK_98765")
+    main_root, wt_root = _setup_sample_worktree(tmp_path)
+    executor = CodeModeExecutor(worktree_root=wt_root, main_checkout_root=main_root)
+
+    res1 = executor.run('"{0.__globals__[os].environ}".format(sh)')
+    assert res1.status == "refused_by_review"
+    assert "CANARY_LEAK_98765" not in res1.model_view()
+
+    res2 = executor.run('"{x.__globals__}".format_map({"x": sh})')
+    assert res2.status == "refused_by_review"
+    assert "CANARY_LEAK_98765" not in res2.model_view()
+
+
+def test_code_mode_scrubs_secret_env_vars_in_subprocess_sh(
+    tmp_path: Path, monkeypatch
+) -> None:
+    canaries = {
+        "INTERNAL_GITLAB_TOKEN": "CANARY_GITLAB_11111",
+        "QWEN_API_KEY": "CANARY_QWEN_22222",
+        "GEMINI_API_KEY": "CANARY_GEMINI_33333",
+        "OPENAI_API_KEY": "CANARY_OPENAI_44444",
+    }
+    for k, v in canaries.items():
+        monkeypatch.setenv(k, v)
+
+    main_root, wt_root = _setup_sample_worktree(tmp_path)
+    executor = CodeModeExecutor(worktree_root=wt_root, main_checkout_root=main_root)
+
+    res = executor.run('(await sh("env")).text')
+    assert res.status == "ok"
+    text_out = str(res.return_value or "")
+    view_out = res.model_view()
+    for val in canaries.values():
+        assert val not in text_out
+        assert val not in view_out
+
+
+def test_code_mode_rejects_empty_or_separator_only_command_and_enforces_cwd(tmp_path: Path) -> None:
+    main_root, wt_root = _setup_sample_worktree(tmp_path)
+    executor = CodeModeExecutor(worktree_root=wt_root, main_checkout_root=main_root)
+
+    for snippet in (
+        'await sh("   ", cwd="/etc", nothrow=True)',
+        'await sh(";", cwd="..", nothrow=True)',
+    ):
+        res = executor.run(snippet)
+        assert res.status == "refused", f"Expected refused for {snippet!r}, got {res.status}"
+        assert len(res.tool_calls) == 1
+        assert res.tool_calls[0].allowed is False
+
+
+def test_code_mode_blocks_general_command_substitution_in_sh(tmp_path: Path) -> None:
+    main_root, wt_root = _setup_sample_worktree(tmp_path)
+    executor = CodeModeExecutor(worktree_root=wt_root, main_checkout_root=main_root)
+
+    for cmd in ("echo $(id)", "echo $(git push --help)", "$(echo git) status"):
+        res = executor.run(f"await sh({cmd!r})")
+        assert res.status == "refused", f"Expected refused for {cmd!r}, got {res.status}"
+        assert res.tool_calls[0].decided_by == "isolation:command_shape"
+
+
+def test_code_mode_enforces_loop_budget_inside_nested_comprehensions(tmp_path: Path) -> None:
+    main_root, wt_root = _setup_sample_worktree(tmp_path)
+    executor = CodeModeExecutor(
+        worktree_root=wt_root,
+        main_checkout_root=main_root,
+        foreground_timeout_s=2.0,
+    )
+
+    res = executor.run("sum(1 for _ in range(1000) for _ in range(1000))")
+    assert res.status == "timeout"
+    assert "budget" in res.error.lower() or "timed out" in res.error.lower()
+
+
+def test_agent_runtime_direct_mode_enforces_read_confinement_path_norm_and_ask_gate(
+    tmp_path: Path,
+) -> None:
+    main_root, wt_root = _setup_sample_worktree(tmp_path)
+    runtime = AgentRuntime(
+        agent_id="worker-direct",
+        role="worker",
+        worktree_root=wt_root,
+        main_checkout_root=main_root,
+        worktree_branch="agent/worker-direct",
+        tools_registry={},
+        tools_schema=[],
+        permissions=PermissionRules.default(),
+    )
+
+    assert runtime._verify_tool_isolation("read_file", {"path": "../../../.env"}).allowed is False
+    assert runtime._verify_tool_isolation("read_file", {"path": ".env"}).allowed is False
+    assert runtime._verify_tool_isolation("list_files", {"subdir": ".."}).allowed is False
+    assert runtime._verify_tool_isolation("write_file", {"path": "sub/../.env", "content": "x"}).allowed is False
+    assert runtime._verify_tool_isolation("run_command", {"command": "pip install evilpkg"}).allowed is False

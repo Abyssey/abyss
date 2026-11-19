@@ -22,6 +22,7 @@ Architectural lineage:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -29,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -47,6 +49,10 @@ from app.domains.workflow.worktree_adapter import GitWorktreeManager
 from app.domains.workflow.worktree_tools import build_agent_tools
 
 _TASK_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{4,32}$")
+_GIT_REF_RE = re.compile(r"^[A-Za-z0-9_./@^~:{}-]+$")
+_COMMIT_RANGE_RE = re.compile(r"^[A-Za-z0-9_./@^~:{}-]+(?:\.\.\.?[A-Za-z0-9_./@^~:{}-]+)?$")
+_SNAPSHOT_MAX_FILES = 2000
+_SNAPSHOT_MAX_FILE_BYTES = 2 * 1024 * 1024  # 2 MiB per file
 _SNAPSHOT_IGNORE_DIRS = frozenset(
     {
         ".git",
@@ -62,6 +68,42 @@ _SNAPSHOT_IGNORE_DIRS = frozenset(
         "build",
     }
 )
+
+
+def _b64_arg(value: str) -> str:
+    """Encode arbitrary user text as URL-safe ASCII base64 (zero shell metacharacters)."""
+    return base64.urlsafe_b64encode((value or "").encode("utf-8")).decode("ascii")
+
+
+def _validate_git_ref(ref: str, label: str = "git ref") -> str:
+    if any(ch in ref for ch in ("\r", "\n", "\x00")):
+        raise ValueError(f"Invalid {label}: control characters are not allowed.")
+    cleaned = ref.strip()
+    if (
+        not cleaned
+        or cleaned.startswith("-")
+        or ".." in cleaned
+        or not _GIT_REF_RE.fullmatch(cleaned)
+    ):
+        raise ValueError(f"Invalid {label}: {cleaned!r}")
+    return cleaned
+
+
+def _validate_commit_range(commit_range: str) -> str:
+    if any(ch in commit_range for ch in ("\r", "\n", "\x00")):
+        raise ValueError("Invalid commit_range: control characters are not allowed.")
+    cleaned = commit_range.strip()
+    if not cleaned or cleaned.startswith("-") or not _COMMIT_RANGE_RE.fullmatch(cleaned):
+        raise ValueError(f"Invalid commit_range: {cleaned!r}")
+    if "..." in cleaned:
+        parts = cleaned.split("...", 1)
+    elif ".." in cleaned:
+        parts = cleaned.split("..", 1)
+    else:
+        parts = [cleaned]
+    for part in parts:
+        _validate_git_ref(part, label="commit_range endpoint")
+    return cleaned
 
 
 # =============================================================================
@@ -119,6 +161,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import html
 import json
 import os
@@ -173,7 +216,7 @@ def _first_doc_line(doc: str, fallback: str) -> str:
     return fallback
 
 
-def scan_repository(root_path: str | Path) -> dict[str, Any]:
+def scan_repository(root_path: str | Path, *, repo_name: str | None = None) -> dict[str, Any]:
     """Scan all real Python files under `root_path` via `ast` and build module/dependency IR."""
     root = Path(root_path).resolve()
     py_files: list[Path] = []
@@ -317,7 +360,7 @@ def scan_repository(root_path: str | Path) -> dict[str, Any]:
         )
 
     return {
-        "repo_name": root.name,
+        "repo_name": (repo_name or root.name).strip() or root.name,
         "total_files": len(modules),
         "total_lines": sum(m["line_count"] for m in modules),
         "domains": [{"name": k, "count": v} for k, v in sorted(domain_counts.items())],
@@ -644,9 +687,11 @@ def generate_project_map(
     root_path: str | Path,
     output_html: str | Path,
     instruction: str = "",
+    *,
+    repo_name: str | None = None,
 ) -> dict[str, Any]:
     """Scan `root_path` and write the standalone interactive HTML map to `output_html`."""
-    scan_data = scan_repository(root_path)
+    scan_data = scan_repository(root_path, repo_name=repo_name)
     rendered = build_project_map_html(scan_data, instruction=instruction)
     out = Path(output_html)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -661,13 +706,29 @@ def generate_project_map(
     }
 
 
+def _decode_b64_arg(encoded: str) -> str:
+    if not encoded:
+        return ""
+    return base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8", errors="replace")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate interactive project structure map HTML.")
     parser.add_argument("--root", default=".", help="Repository root to AST-scan.")
     parser.add_argument("--output", default="project_map/index.html", help="Output HTML file path.")
     parser.add_argument("--instruction", default="", help="Optional user instruction subtitle.")
+    parser.add_argument("--instruction-b64", default="", help="Base64-encoded user instruction subtitle.")
+    parser.add_argument("--repo-name", default="", help="Optional display repository name.")
+    parser.add_argument("--repo-name-b64", default="", help="Base64-encoded display repository name.")
     args = parser.parse_args()
-    summary = generate_project_map(args.root, args.output, instruction=args.instruction)
+    instruction = _decode_b64_arg(args.instruction_b64) if args.instruction_b64 else args.instruction
+    repo_name = (_decode_b64_arg(args.repo_name_b64) if args.repo_name_b64 else args.repo_name) or None
+    summary = generate_project_map(
+        args.root,
+        args.output,
+        instruction=instruction,
+        repo_name=repo_name,
+    )
     print(json.dumps(summary, ensure_ascii=False))
 
 
@@ -751,6 +812,7 @@ Genuine Workspace & Service Health Inspection Checker + Standalone Interactive H
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import json
 import os
@@ -760,6 +822,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -920,14 +983,18 @@ def render_dashboard_html(
 ) -> str:
     """Render a 100% standalone interactive HTML5 Operations Inspection Dashboard."""
     summary = summarize_checks(checks)
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     payload = {
         "repo_name": repo_name,
+        "generated_at": generated_at,
+        "snapshot_mode": "static_readonly",
         "summary": summary,
         "checks": [c.to_dict() for c in checks],
     }
     safe_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
     safe_repo = html.escape(repo_name)
     safe_sub = html.escape(instruction.strip() or "실시간 서비스/저장소 상태 점검 대시보드")
+    safe_generated_at = html.escape(generated_at)
 
     return f"""<!DOCTYPE html>
 <html lang="ko">
@@ -991,7 +1058,7 @@ def render_dashboard_html(
     <header>
       <div>
         <h1>🩺 {safe_repo} — Service Inspection Dashboard</h1>
-        <p class="sub">{safe_sub} · <span id="last-run">초기 스캔 완료</span></p>
+        <p class="sub">{safe_sub} · <span id="last-run">스냅샷 측정 시각: {safe_generated_at}</span></p>
       </div>
       <button id="rerun-btn" class="btn" type="button">🔄 Re-run Health Check</button>
     </header>
@@ -1018,19 +1085,37 @@ def render_dashboard_html(
   <script>
     (function () {{
       const payload = JSON.parse(document.getElementById("inspection-data").textContent || "{{}}");
-      const checks = payload.checks || [];
+      const snapshotChecks = Object.freeze(
+        (payload.checks || []).map((c) => Object.freeze(Object.assign({{}}, c)))
+      );
+      const generatedAt = payload.generated_at || "unknown";
       let filter = "all";
-      let runCount = 1;
       const rowsEl = document.getElementById("check-rows");
       const detailEl = document.getElementById("detail-box");
       const lastRunEl = document.getElementById("last-run");
 
       function esc(s) {{
-        return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        return String(s || "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }}
+
+      function recomputeKpis() {{
+        const total = snapshotChecks.length;
+        const healthy = snapshotChecks.filter((c) => c.status === "healthy").length;
+        const warning = snapshotChecks.filter((c) => c.status === "warning").length;
+        const critical = snapshotChecks.filter((c) => c.status === "critical").length;
+        document.getElementById("kpi-total").textContent = String(total);
+        document.getElementById("kpi-healthy").textContent = String(healthy);
+        document.getElementById("kpi-warning").textContent = String(warning);
+        document.getElementById("kpi-critical").textContent = String(critical);
       }}
 
       function render() {{
-        const list = checks.filter((c) => filter === "all" || c.status === filter);
+        const list = snapshotChecks.filter((c) => filter === "all" || c.status === filter);
         rowsEl.innerHTML = list.length ? list.map((c) => (
           '<div class="row" data-id="' + esc(c.id) + '">' +
             '<span class="pill ' + esc(c.status) + '">' + esc(c.status.toUpperCase()) + '</span>' +
@@ -1041,7 +1126,7 @@ def render_dashboard_html(
 
         rowsEl.querySelectorAll(".row[data-id]").forEach((el) => {{
           el.addEventListener("click", () => {{
-            const c = checks.find((x) => x.id === el.getAttribute("data-id"));
+            const c = snapshotChecks.find((x) => x.id === el.getAttribute("data-id"));
             if (!c) return;
             detailEl.innerHTML =
               '<strong>' + esc(c.name) + ' (' + esc(c.status.toUpperCase()) + ')</strong>' +
@@ -1060,14 +1145,20 @@ def render_dashboard_html(
       }});
 
       document.getElementById("rerun-btn").addEventListener("click", () => {{
-        runCount += 1;
-        checks.forEach((c) => {{
-          c.latency_ms = Math.max(0.4, Number((c.latency_ms + ((runCount % 3) - 1) * 0.3).toFixed(2)));
+        filter = "all";
+        document.querySelectorAll(".filter-btn").forEach((b) => {{
+          b.classList.toggle("active", b.getAttribute("data-filter") === "all");
         }});
-        lastRunEl.textContent = "재점검 #" + runCount + " 완료 (" + new Date().toLocaleTimeString() + ")";
+        recomputeKpis();
         render();
+        lastRunEl.textContent = "스냅샷 기준 재검증 완료 · 원본 측정: " + generatedAt;
+        detailEl.innerHTML =
+          '<strong>정적 스냅샷 안내 (샌드박스 Live Preview)</strong>' +
+          '<p class="sub">이 화면은 빌드 시점에 실제 실행한 점검 스냅샷(' + esc(generatedAt) + ')을 변조 없이 그대로 표시합니다. ' +
+          '측정값을 새로 갱신하려면 Worktree에서 <code>python -m inspection_dashboard.checker --root . --output inspection_dashboard/index.html</code>를 다시 실행하세요.</p>';
       }});
 
+      recomputeKpis();
       render();
     }})();
   </script>
@@ -1080,17 +1171,26 @@ def generate_inspection_dashboard(
     root_path: str | Path,
     output_html: str | Path,
     instruction: str = "",
+    *,
+    repo_name: str | None = None,
 ) -> dict[str, Any]:
     root = Path(root_path).resolve()
+    display_name = (repo_name or root.name).strip() or root.name
     checks = run_health_checks(root)
     summary = summarize_checks(checks)
     out = Path(output_html)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(
-        render_dashboard_html(checks, repo_name=root.name, instruction=instruction),
+        render_dashboard_html(checks, repo_name=display_name, instruction=instruction),
         encoding="utf-8",
     )
-    return {"output_html": str(out), "repo_name": root.name, **summary}
+    return {"output_html": str(out), "repo_name": display_name, **summary}
+
+
+def _decode_b64_arg(encoded: str) -> str:
+    if not encoded:
+        return ""
+    return base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8", errors="replace")
 
 
 def main() -> None:
@@ -1098,8 +1198,23 @@ def main() -> None:
     parser.add_argument("--root", default=".", help="Workspace root to inspect.")
     parser.add_argument("--output", default="inspection_dashboard/index.html", help="Output HTML file path.")
     parser.add_argument("--instruction", default="", help="Optional instruction subtitle.")
+    parser.add_argument("--instruction-b64", default="", help="Base64-encoded instruction subtitle.")
+    parser.add_argument("--repo-name", default="", help="Optional display repository name.")
+    parser.add_argument("--repo-name-b64", default="", help="Base64-encoded display repository name.")
     args = parser.parse_args()
-    print(json.dumps(generate_inspection_dashboard(args.root, args.output, instruction=args.instruction), ensure_ascii=False))
+    instruction = _decode_b64_arg(args.instruction_b64) if args.instruction_b64 else args.instruction
+    repo_name = (_decode_b64_arg(args.repo_name_b64) if args.repo_name_b64 else args.repo_name) or None
+    print(
+        json.dumps(
+            generate_inspection_dashboard(
+                args.root,
+                args.output,
+                instruction=instruction,
+                repo_name=repo_name,
+            ),
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
@@ -1139,6 +1254,8 @@ def test_generate_inspection_dashboard_writes_self_contained_html(tmp_path: Path
     assert "<!DOCTYPE html>" in html_text
     assert "Re-run Health Check" in html_text
     assert "inspection-data" in html_text
+    assert "generated_at" in html_text
+    assert "runCount % 3" not in html_text
     assert "fonts.googleapis.com" not in html_text
     assert "localStorage" not in html_text
 '''
@@ -1156,6 +1273,7 @@ and the real files discovered in the target repository.
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import json
 import os
@@ -1165,8 +1283,15 @@ from typing import Any
 IGNORE_DIRS = frozenset({".git", ".abyss", ".agents", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"})
 
 
-def build_custom_preview(root_path: str | Path, output_html: str | Path, instruction: str) -> dict[str, Any]:
+def build_custom_preview(
+    root_path: str | Path,
+    output_html: str | Path,
+    instruction: str,
+    *,
+    repo_name: str | None = None,
+) -> dict[str, Any]:
     root = Path(root_path).resolve()
+    display_name = (repo_name or root.name).strip() or root.name
     files: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in IGNORE_DIRS)
@@ -1175,13 +1300,13 @@ def build_custom_preview(root_path: str | Path, output_html: str | Path, instruc
                 files.append((Path(dirpath) / fn).relative_to(root).as_posix())
     files = files[:40]
     safe_inst = html.escape(instruction.strip() or "커스텀 인터랙티브 웹 기능")
-    safe_json = json.dumps({"repo": root.name, "instruction": instruction, "files": files}, ensure_ascii=False).replace("</", "<\\/")
+    safe_json = json.dumps({"repo": display_name, "instruction": instruction, "files": files}, ensure_ascii=False).replace("</", "<\\/")
 
     doc = f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
   <meta charset="UTF-8" />
-  <title>{html.escape(root.name)} — Custom Feature Preview</title>
+  <title>{html.escape(display_name)} — Custom Feature Preview</title>
   <style>
     body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#0f172a; color:#f1f5f9; padding:20px; }}
     .box {{ max-width:860px; margin:0 auto; background:#1e293b; border:1px solid #334155; border-radius:14px; padding:18px 20px; }}
@@ -1191,7 +1316,7 @@ def build_custom_preview(root_path: str | Path, output_html: str | Path, instruc
 </head>
 <body>
   <div class="box">
-    <h1>✨ {html.escape(root.name)} — Custom Build Preview</h1>
+    <h1>✨ {html.escape(display_name)} — Custom Build Preview</h1>
     <p>요청: <strong>{safe_inst}</strong> (발견된 파일 {len(files)}개)</p>
     <input id="q" type="search" placeholder="파일 필터링..." />
     <ul id="list"></ul>
@@ -1202,9 +1327,12 @@ def build_custom_preview(root_path: str | Path, output_html: str | Path, instruc
       const d = JSON.parse(document.getElementById("custom-data").textContent || "{{}}");
       const list = document.getElementById("list");
       const q = document.getElementById("q");
+      function esc(s) {{
+        return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      }}
       function render() {{
         const term = (q.value || "").toLowerCase();
-        list.innerHTML = (d.files || []).filter((f) => f.toLowerCase().includes(term)).map((f) => "<li>" + f + "</li>").join("");
+        list.innerHTML = (d.files || []).filter((f) => f.toLowerCase().includes(term)).map((f) => "<li>" + esc(f) + "</li>").join("");
       }}
       q.addEventListener("input", render);
       render();
@@ -1219,13 +1347,29 @@ def build_custom_preview(root_path: str | Path, output_html: str | Path, instruc
     return {"output_html": str(out), "files_indexed": len(files)}
 
 
+def _decode_b64_arg(encoded: str) -> str:
+    if not encoded:
+        return ""
+    return base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8", errors="replace")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".")
     parser.add_argument("--output", default="custom_feature/index.html")
     parser.add_argument("--instruction", default="")
+    parser.add_argument("--instruction-b64", default="")
+    parser.add_argument("--repo-name", default="")
+    parser.add_argument("--repo-name-b64", default="")
     args = parser.parse_args()
-    print(json.dumps(build_custom_preview(args.root, args.output, args.instruction), ensure_ascii=False))
+    instruction = _decode_b64_arg(args.instruction_b64) if args.instruction_b64 else args.instruction
+    repo_name = (_decode_b64_arg(args.repo_name_b64) if args.repo_name_b64 else args.repo_name) or None
+    print(
+        json.dumps(
+            build_custom_preview(args.root, args.output, instruction, repo_name=repo_name),
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
@@ -1288,6 +1432,7 @@ class CodingTaskService:
         self.git_resolver = InternalGitSourceResolver(self.settings)
         self.rubric = EvaluatorRubric()
         self.registry_path = self.settings.demo_workspace / ".abyss" / "build_tasks.json"
+        self._registry_lock = threading.RLock()
         self._tasks: dict[str, BuildTaskRecord] = {}
         self._load_registry()
 
@@ -1296,24 +1441,35 @@ class CodingTaskService:
             self.event_callback(event)
 
     def _load_registry(self) -> None:
-        if not self.registry_path.exists():
-            return
-        try:
-            raw = json.loads(self.registry_path.read_text(encoding="utf-8"))
-            if isinstance(raw, list):
-                for item in raw:
-                    rec = BuildTaskRecord(**item)
-                    self._tasks[rec.task_id] = rec
-        except Exception:  # noqa: BLE001
-            self._tasks = {}
+        with self._registry_lock:
+            if not self.registry_path.exists():
+                return
+            try:
+                raw = json.loads(self.registry_path.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    for item in raw:
+                        rec = BuildTaskRecord(**item)
+                        self._tasks[rec.task_id] = rec
+            except Exception:  # noqa: BLE001
+                self._tasks = {}
 
     def _save_registry(self) -> None:
-        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = [rec.to_dict() for rec in self._tasks.values()]
-        self.registry_path.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        with self._registry_lock:
+            self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = [rec.to_dict() for rec in self._tasks.values()]
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=".build_tasks_",
+                suffix=".tmp",
+                dir=str(self.registry_path.parent),
+            )
+            tmp_path = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, self.registry_path)
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                raise
 
     def sanitize_error(self, exc: Exception) -> str:
         secrets = (self.settings.internal_gitlab_token,) if self.settings.internal_gitlab_token else ()
@@ -1328,21 +1484,23 @@ class CodingTaskService:
                 {
                     "act": "Act 1",
                     "title": "낯선 프로젝트 구조 한눈에 파악하기",
-                    "prompt": "이 프로젝트 구조랑 핵심 파일들 쉽게 설명해줘",
+                    "prompt": "이 프로젝트 구조와 핵심 파일을 한눈에 정리해줘",
                     "endpoint": "POST /api/repo-onboard/analyze",
                 },
                 {
-                    "act": "Act 2-A",
+                    "act": "Act 2 (기본)",
                     "title": "인터랙티브 프로젝트 지도 웹 앱 만들기 + Live Preview",
-                    "prompt": "이 프로젝트 구조 한눈에 보는 인터랙티브 웹 페이지 만들어줘",
+                    "prompt": "이 프로젝트 지도를 클릭해서 볼 수 있는 웹페이지를 만들어줘",
                     "endpoint": "POST /api/workflow/tasks/build",
                     "preset": "project_map_app",
                 },
                 {
-                    "act": "Act 2-B",
-                    "title": "Code Mode (REPL) 1-Step 자동 수정 + 테스트",
-                    "prompt": "설정 파일 자동 찾아서 값 고치고 테스트까지 한 번에 끝내줘",
-                    "endpoint": "POST /api/code-mode/run",
+                    "act": "Act 2 (보조)",
+                    "title": "서비스 상태 점검 대시보드 만들기 + Code Mode (REPL)",
+                    "prompt": "서비스 상태를 한눈에 보는 점검 대시보드 웹페이지를 만들어줘",
+                    "endpoint": "POST /api/workflow/tasks/build",
+                    "preset": "inspection_dashboard",
+                    "code_mode_endpoint": "POST /api/code-mode/run",
                     "scenario_id": "retry_policy",
                 },
                 {
@@ -1355,7 +1513,7 @@ class CodingTaskService:
                 {
                     "act": "Act 4",
                     "title": "독립 코드 리뷰어가 보안·버그 지적 + 승인 검증",
-                    "prompt": "방금 올라온 코드에 보안 문제나 버그 없는지 꼼꼼하게 리뷰해줘",
+                    "prompt": "방금 작업한 브랜치 코드에 보안 문제나 버그가 없는지 리뷰해줘",
                     "endpoint": "POST /api/workflow/tasks/review",
                     "presets": ["defective_mr", "clean_branch"],
                 },
@@ -1364,14 +1522,14 @@ class CodingTaskService:
                 {
                     "id": "project_map_app",
                     "label": "★ 프로젝트 구조 지도 웹 앱 만들기 (Act 2 추천)",
-                    "instruction": "이 프로젝트 구조 한눈에 보는 인터랙티브 웹 페이지 만들어줘",
+                    "instruction": "이 프로젝트 지도를 클릭해서 볼 수 있는 웹페이지를 만들어줘",
                     "preview_file": "project_map/index.html",
                     "badge": "Live Preview · AST Map",
                 },
                 {
                     "id": "inspection_dashboard",
                     "label": "서비스 상태 점검 대시보드 만들기 (보조 예시)",
-                    "instruction": "우리 서비스 상태 점검 대시보드 화면이랑 체크 코드 만들어줘",
+                    "instruction": "서비스 상태를 한눈에 보는 점검 대시보드 웹페이지를 만들어줘",
                     "preview_file": "inspection_dashboard/index.html",
                     "badge": "Live Preview · Ops Health",
                 },
@@ -1398,7 +1556,7 @@ class CodingTaskService:
             "target_sources": [
                 {"id": "demo", "label": "샘플 로컬 저장소 (demo)"},
                 {"id": "self", "label": "현재 로컬 프로젝트 폴더 (self)"},
-                {"id": "internal-origin", "label": "오프라인 사내 원격 시뮬레이터 (internal-origin)"},
+                {"id": "internal-origin", "label": "오프라인 테스트용 로컬 원격 (internal-origin)"},
             ],
         }
 
@@ -1408,18 +1566,31 @@ class CodingTaskService:
     @staticmethod
     def _copy_clean_snapshot(src_dir: Path, dst_dir: Path) -> None:
         dst_dir.mkdir(parents=True, exist_ok=True)
-        for dirpath, dirnames, filenames in os.walk(src_dir):
-            dirnames[:] = [d for d in dirnames if d not in _SNAPSHOT_IGNORE_DIRS]
+        copied_count = 0
+        for dirpath, dirnames, filenames in os.walk(src_dir, followlinks=False):
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if d not in _SNAPSHOT_IGNORE_DIRS and not (Path(dirpath) / d).is_symlink()
+            ]
             rel_dir = Path(dirpath).relative_to(src_dir)
             target_dir = dst_dir / rel_dir
             target_dir.mkdir(parents=True, exist_ok=True)
             for fn in filenames:
+                if copied_count >= _SNAPSHOT_MAX_FILES:
+                    return
                 if fn.endswith((".pyc", ".pyo")):
                     continue
                 src_file = Path(dirpath) / fn
-                if src_file.is_symlink():
+                if src_file.is_symlink() or not src_file.is_file():
                     continue
-                shutil.copy2(src_file, target_dir / fn)
+                try:
+                    if src_file.stat().st_size > _SNAPSHOT_MAX_FILE_BYTES:
+                        continue
+                    shutil.copyfile(src_file, target_dir / fn)
+                    copied_count += 1
+                except OSError:
+                    continue
 
     def _prepare_build_workspace(
         self, task_id: str, repo_url_or_path: str
@@ -1515,9 +1686,14 @@ class CodingTaskService:
     # Act 2 Visual Build Execution (`POST /api/workflow/tasks/build`)
     # =========================================================================
     def _preset_blueprint(
-        self, preset: Literal["project_map_app", "inspection_dashboard", "custom"], instruction: str
+        self,
+        preset: Literal["project_map_app", "inspection_dashboard", "custom"],
+        instruction: str,
+        repo_name: str = "Workspace",
     ) -> dict[str, Any]:
-        safe_inst = instruction.replace('"', "'").replace("\n", " ").strip()
+        inst_b64 = _b64_arg(instruction)
+        repo_b64 = _b64_arg(repo_name)
+        safe_title = re.sub(r"[\r\n\t]+", " ", instruction).strip()[:48]
         if preset == "inspection_dashboard":
             return {
                 "files": [
@@ -1525,7 +1701,11 @@ class CodingTaskService:
                     ("inspection_dashboard/checker.py", INSPECTION_CHECKER_CODE),
                     ("tests/test_inspection_dashboard.py", INSPECTION_TEST_CODE),
                 ],
-                "build_cmd": f'python -m inspection_dashboard.checker --root . --output inspection_dashboard/index.html --instruction "{safe_inst}"',
+                "build_cmd": (
+                    f"python -m inspection_dashboard.checker --root . "
+                    f"--output inspection_dashboard/index.html "
+                    f"--instruction-b64 {inst_b64} --repo-name-b64 {repo_b64}"
+                ),
                 "test_file": "tests/test_inspection_dashboard.py",
                 "preview_rel_path": "inspection_dashboard/index.html",
                 "commit_msg": "feat(inspection-dashboard): add real workspace health checker & interactive HTML dashboard",
@@ -1537,10 +1717,14 @@ class CodingTaskService:
                     ("custom_feature/builder.py", CUSTOM_FEATURE_BUILDER_CODE),
                     ("tests/test_custom_feature.py", CUSTOM_FEATURE_TEST_CODE),
                 ],
-                "build_cmd": f'python -m custom_feature.builder --root . --output custom_feature/index.html --instruction "{safe_inst}"',
+                "build_cmd": (
+                    f"python -m custom_feature.builder --root . "
+                    f"--output custom_feature/index.html "
+                    f"--instruction-b64 {inst_b64} --repo-name-b64 {repo_b64}"
+                ),
                 "test_file": "tests/test_custom_feature.py",
                 "preview_rel_path": "custom_feature/index.html",
-                "commit_msg": f"feat(custom): implement interactive preview for '{safe_inst[:48]}'",
+                "commit_msg": f"feat(custom): implement interactive preview for '{safe_title}'",
             }
         # Default: project_map_app
         return {
@@ -1549,7 +1733,11 @@ class CodingTaskService:
                 ("project_map/builder.py", PROJECT_MAP_BUILDER_CODE),
                 ("tests/test_project_map.py", PROJECT_MAP_TEST_CODE),
             ],
-            "build_cmd": f'python -m project_map.builder --root . --output project_map/index.html --instruction "{safe_inst}"',
+            "build_cmd": (
+                f"python -m project_map.builder --root . "
+                f"--output project_map/index.html "
+                f"--instruction-b64 {inst_b64} --repo-name-b64 {repo_b64}"
+            ),
             "test_file": "tests/test_project_map.py",
             "preview_rel_path": "project_map/index.html",
             "commit_msg": "feat(project-map): add AST repository scanner & interactive HTML project map",
@@ -1561,15 +1749,35 @@ class CodingTaskService:
         repo_url_or_path: str,
         instruction: str,
         preset: Literal["project_map_app", "inspection_dashboard", "custom"],
+        base_branch: str | None,
         use_code_mode: bool,
         push_to_remote: bool,
     ) -> dict[str, Any]:
         task_id = f"task-{uuid.uuid4().hex[:8]}"
         branch_name = f"agent/{task_id}"
-        blueprint = self._preset_blueprint(preset, instruction)
+
+        validated_base: str | None = None
+        if base_branch is not None and base_branch.strip():
+            validated_base = _validate_git_ref(base_branch, label="base_branch")
 
         mgr, repo_name, source_type, remote_url = self._prepare_build_workspace(task_id, repo_url_or_path)
-        wt_info = mgr.create_worktree(agent_id=task_id, branch_name=branch_name)
+        blueprint = self._preset_blueprint(preset, instruction, repo_name=repo_name)
+
+        effective_base = validated_base
+        if effective_base is not None:
+            verify_base = mgr._run_git(["rev-parse", "--verify", effective_base])
+            if verify_base.returncode != 0:
+                # Fall back to repo's actual default branch when caller kept default "main" on a "master"/custom repo
+                if effective_base == "main":
+                    effective_base = mgr.get_default_branch()
+                else:
+                    raise ValueError(f"저장소에서 기준 브랜치 '{effective_base}'를 찾을 수 없습니다.")
+
+        wt_info = mgr.create_worktree(
+            agent_id=task_id,
+            base_branch=effective_base,
+            branch_name=branch_name,
+        )
 
         self._emit(
             {
@@ -1628,10 +1836,12 @@ class CodingTaskService:
             if use_code_mode:
                 if turn == 1:
                     lines: list[str] = []
-                    for idx, (fpath, fcontent) in enumerate(files_to_write):
+                    for _idx, (fpath, fcontent) in enumerate(files_to_write):
                         lines.append(f"await write({fpath!r}, {fcontent!r})")
                     lines.append(f"build_out = await sh({build_cmd!r})")
-                    lines.append(f'test_out = await sh("pytest {test_file} -v", nothrow=True)')
+                    lines.append(
+                        f'test_out = await sh("pytest -p no:cacheprovider {test_file} -v", nothrow=True)'
+                    )
                     lines.append('{"build_ok": build_out.ok, "test_ok": test_out.ok, "test_tail": test_out.tail(6)}')
                     return {
                         "content": f"<think>[Builder · Code Mode REPL] 1-Step REPL로 {preset} 소스 작성, 실제 AST/점검 HTML 생성 및 pytest 검증을 일괄 수행합니다.</think>",
@@ -1689,7 +1899,9 @@ class CodingTaskService:
                             "type": "function",
                             "function": {
                                 "name": "run_command",
-                                "arguments": json.dumps({"command": f"pytest {test_file} -v"}),
+                                "arguments": json.dumps(
+                                    {"command": f"pytest -p no:cacheprovider {test_file} -v"}
+                                ),
                             },
                         },
                     ],
@@ -1739,20 +1951,19 @@ class CodingTaskService:
             llm_callable=llm_bridge,
         )
 
-        # Authoritative pytest verification inside the isolated worktree
+        # Authoritative pytest verification inside the isolated worktree (cache disabled)
         pytest_env = os.environ.copy()
         pytest_env["PYTHONPATH"] = str(wt_info.worktree_path)
         pytest_env["PYTHONDONTWRITEBYTECODE"] = "1"
-        pytest_cache = mgr.repo_root / ".abyss" / f"pytest_cache_{task_id}"
         pytest_proc = subprocess.run(
             [
                 sys.executable,
                 "-m",
                 "pytest",
+                "-p",
+                "no:cacheprovider",
                 test_file,
                 "-v",
-                "-o",
-                f"cache_dir={pytest_cache}",
             ],
             cwd=str(wt_info.worktree_path),
             env=pytest_env,
@@ -1817,8 +2028,9 @@ class CodingTaskService:
             remote_url=final_remote_url,
             created_at=time.time(),
         )
-        self._tasks[task_id] = record
-        self._save_registry()
+        with self._registry_lock:
+            self._tasks[task_id] = record
+            self._save_registry()
 
         status: Literal["completed", "failed"] = "completed" if (tests_passed and has_preview) else "failed"
         summary = (
@@ -1871,8 +2083,9 @@ class CodingTaskService:
         self,
         *,
         repo_url_or_path: str = "demo",
-        instruction: str = "이 프로젝트 구조 한눈에 보는 인터랙티브 웹 페이지 만들어줘",
+        instruction: str = "이 프로젝트 지도를 클릭해서 볼 수 있는 웹페이지를 만들어줘",
         preset: Literal["project_map_app", "inspection_dashboard", "custom"] = "project_map_app",
+        base_branch: str | None = "main",
         use_code_mode: bool = False,
         push_to_remote: bool = True,
     ) -> dict[str, Any]:
@@ -1881,6 +2094,7 @@ class CodingTaskService:
             repo_url_or_path=repo_url_or_path,
             instruction=instruction,
             preset=preset,
+            base_branch=base_branch,
             use_code_mode=use_code_mode,
             push_to_remote=push_to_remote,
         )
@@ -1897,10 +2111,11 @@ class CodingTaskService:
         if not task_id or not _TASK_ID_RE.fullmatch(task_id):
             raise KeyError(f"Unknown or invalid preview task_id: {task_id!r}")
 
-        rec = self._tasks.get(task_id)
-        if rec is None:
-            self._load_registry()
+        with self._registry_lock:
             rec = self._tasks.get(task_id)
+            if rec is None:
+                self._load_registry()
+                rec = self._tasks.get(task_id)
         if rec is None:
             raise KeyError(f"Preview task '{task_id}' not found.")
 
@@ -1923,44 +2138,42 @@ class CodingTaskService:
     # Act 4 Independent Read-Only Review (`POST /api/workflow/tasks/review`)
     # =========================================================================
     def _find_record_by_branch(self, branch_name: str | None) -> BuildTaskRecord | None:
-        if not self._tasks:
-            self._load_registry()
-        if not self._tasks:
-            return None
-        if branch_name:
-            for rec in reversed(list(self._tasks.values())):
-                if rec.branch_name == branch_name:
-                    return rec
-            return None
-        return max(self._tasks.values(), key=lambda r: r.created_at)
+        with self._registry_lock:
+            if not self._tasks:
+                self._load_registry()
+            if not self._tasks:
+                return None
+            if branch_name:
+                for rec in reversed(list(self._tasks.values())):
+                    if rec.branch_name == branch_name:
+                        return rec
+                return None
+            return max(self._tasks.values(), key=lambda r: r.created_at)
 
     def _run_readonly_pytest_on_branch(
-        self, repo_root: Path, branch_name: str, existing_worktree: Path | None
+        self, repo_root: Path, branch_name: str
     ) -> dict[str, Any]:
-        """Run pytest strictly read-only without dirtying the branch or main working tree."""
-        cache_dir = Path(tempfile.mkdtemp(prefix="rev_pytest_", dir=str(self.settings.task_runs_dir)))
+        """Run pytest strictly read-only in a detached ephemeral worktree (never mutates target branch or worktree)."""
         ephemeral_wt: Path | None = None
         try:
-            run_dir = existing_worktree
-            if run_dir is None or not run_dir.exists():
-                ephemeral_wt = Path(
-                    tempfile.mkdtemp(prefix="rev_wt_", dir=str(self.settings.task_runs_dir))
-                )
-                shutil.rmtree(ephemeral_wt, ignore_errors=True)
-                add_res = subprocess.run(
-                    ["git", "worktree", "add", "--detach", str(ephemeral_wt), branch_name],
-                    cwd=str(repo_root),
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if add_res.returncode != 0:
-                    return {
-                        "exit_code": add_res.returncode,
-                        "passed": False,
-                        "output": f"Could not checkout detached review worktree: {add_res.stderr.strip()}",
-                    }
-                run_dir = ephemeral_wt
+            ephemeral_wt = Path(
+                tempfile.mkdtemp(prefix="rev_wt_", dir=str(self.settings.task_runs_dir))
+            )
+            shutil.rmtree(ephemeral_wt, ignore_errors=True)
+            add_res = subprocess.run(
+                ["git", "worktree", "add", "--detach", str(ephemeral_wt), branch_name],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if add_res.returncode != 0:
+                return {
+                    "exit_code": add_res.returncode,
+                    "passed": False,
+                    "output": f"Could not checkout detached review worktree: {add_res.stderr.strip()}",
+                }
+            run_dir = ephemeral_wt
 
             tests_dir = run_dir / "tests"
             if not tests_dir.exists() or not list(tests_dir.glob("test_*.py")):
@@ -1978,10 +2191,10 @@ class CodingTaskService:
                     sys.executable,
                     "-m",
                     "pytest",
+                    "-p",
+                    "no:cacheprovider",
                     "tests",
                     "-q",
-                    "-o",
-                    f"cache_dir={cache_dir}",
                 ],
                 cwd=str(run_dir),
                 env=env,
@@ -2004,9 +2217,15 @@ class CodingTaskService:
                     text=True,
                     check=False,
                 )
+                subprocess.run(
+                    ["git", "worktree", "prune"],
+                    cwd=str(repo_root),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
                 if ephemeral_wt.exists():
                     shutil.rmtree(ephemeral_wt, ignore_errors=True)
-            shutil.rmtree(cache_dir, ignore_errors=True)
 
     def _run_review_sync(
         self,
@@ -2027,6 +2246,19 @@ class CodingTaskService:
         diff_text = ""
         test_result: dict[str, Any] | None = None
 
+        # Validate any caller-supplied Git refs/ranges upfront (blocks Git flag injection)
+        validated_branch: str | None = (
+            _validate_git_ref(branch_name, label="branch_name")
+            if branch_name is not None and branch_name.strip()
+            else None
+        )
+        validated_base = _validate_git_ref(base_branch or "main", label="base_branch")
+        validated_range: str | None = (
+            _validate_commit_range(commit_range)
+            if commit_range is not None and commit_range.strip()
+            else None
+        )
+
         # Mode A: Direct raw_diff OR Defective MR preset (Act 4-A)
         if raw_diff is not None and raw_diff.strip():
             diff_text = raw_diff
@@ -2038,33 +2270,36 @@ class CodingTaskService:
             target_label = "preset:defective_mr (inspection_dashboard/api_handler.py)"
         else:
             # Mode B: Branch / Commit-range Read-Only Review (Act 4-B or custom branch)
-            matched_rec = self._find_record_by_branch(branch_name)
-            if branch_name is None and effective_preset in ("clean_branch", "latest_build_branch"):
+            matched_rec = self._find_record_by_branch(validated_branch)
+            if validated_branch is None and effective_preset in ("clean_branch", "latest_build_branch"):
                 if matched_rec is None:
                     raise ValueError(
                         "리뷰할 빌드 브랜치가 아직 없습니다. 먼저 Act 2에서 웹 앱을 생성하거나 "
                         "리뷰할 `branch_name` 또는 `raw_diff`를 지정하세요."
                     )
-                branch_name = matched_rec.branch_name
-                base_branch = matched_rec.base_branch
+                validated_branch = matched_rec.branch_name
+                validated_base = matched_rec.base_branch
 
-            if matched_rec is not None and branch_name == matched_rec.branch_name:
+            if matched_rec is not None and validated_branch == matched_rec.branch_name:
                 repo_root = Path(matched_rec.main_checkout_root).resolve()
-                wt_path = Path(matched_rec.worktree_path).resolve()
                 source_type = matched_rec.source_type
-                diff_spec = commit_range or f"{matched_rec.base_branch}...{matched_rec.branch_name}"
+                diff_spec = validated_range or f"{matched_rec.base_branch}...{matched_rec.branch_name}"
                 target_label = f"{matched_rec.repo_name}:{diff_spec}"
                 diff_proc = subprocess.run(
-                    ["git", "diff", diff_spec],
+                    ["git", "diff", "--end-of-options", diff_spec, "--"],
                     cwd=str(repo_root),
                     capture_output=True,
                     text=True,
                     check=False,
                 )
+                if diff_proc.returncode != 0:
+                    raise ValueError(
+                        f"git diff 실패 ({diff_spec}): {diff_proc.stderr.strip() or 'invalid ref'}"
+                    )
                 diff_text = diff_proc.stdout
                 if run_tests:
                     test_result = self._run_readonly_pytest_on_branch(
-                        repo_root, matched_rec.branch_name, existing_worktree=wt_path
+                        repo_root, matched_rec.branch_name
                     )
             else:
                 with self.git_resolver.checkout(
@@ -2079,11 +2314,11 @@ class CodingTaskService:
                             "Git 저장소 경로나 `raw_diff`를 입력하세요."
                         )
                     source_type = resolved.source_type
-                    target_branch = branch_name or "HEAD"
+                    target_branch = validated_branch or "HEAD"
                     # Support remote-tracking branch fallback if cloned from bare/GitLab
                     branch_ref = target_branch
                     verify = subprocess.run(
-                        ["git", "rev-parse", "--verify", target_branch],
+                        ["git", "rev-parse", "--verify", "--end-of-options", target_branch],
                         cwd=str(resolved.local_path),
                         capture_output=True,
                         text=True,
@@ -2092,7 +2327,7 @@ class CodingTaskService:
                     if verify.returncode != 0:
                         remote_ref = f"origin/{target_branch}"
                         verify_r = subprocess.run(
-                            ["git", "rev-parse", "--verify", remote_ref],
+                            ["git", "rev-parse", "--verify", "--end-of-options", remote_ref],
                             cwd=str(resolved.local_path),
                             capture_output=True,
                             text=True,
@@ -2103,9 +2338,9 @@ class CodingTaskService:
                         else:
                             raise ValueError(f"저장소에서 브랜치 '{target_branch}'를 찾을 수 없습니다.")
 
-                    base_ref = base_branch
+                    base_ref = validated_base
                     verify_b = subprocess.run(
-                        ["git", "rev-parse", "--verify", base_ref],
+                        ["git", "rev-parse", "--verify", "--end-of-options", base_ref],
                         cwd=str(resolved.local_path),
                         capture_output=True,
                         text=True,
@@ -2113,27 +2348,31 @@ class CodingTaskService:
                     )
                     if verify_b.returncode != 0:
                         if subprocess.run(
-                            ["git", "rev-parse", "--verify", f"origin/{base_branch}"],
+                            ["git", "rev-parse", "--verify", "--end-of-options", f"origin/{validated_base}"],
                             cwd=str(resolved.local_path),
                             capture_output=True,
                             text=True,
                             check=False,
                         ).returncode == 0:
-                            base_ref = f"origin/{base_branch}"
+                            base_ref = f"origin/{validated_base}"
 
-                    diff_spec = commit_range or f"{base_ref}...{branch_ref}"
+                    diff_spec = validated_range or f"{base_ref}...{branch_ref}"
                     target_label = f"{resolved.repo_name}:{diff_spec}"
                     diff_proc = subprocess.run(
-                        ["git", "diff", diff_spec],
+                        ["git", "diff", "--end-of-options", diff_spec, "--"],
                         cwd=str(resolved.local_path),
                         capture_output=True,
                         text=True,
                         check=False,
                     )
+                    if diff_proc.returncode != 0:
+                        raise ValueError(
+                            f"git diff 실패 ({diff_spec}): {diff_proc.stderr.strip() or 'invalid ref'}"
+                        )
                     diff_text = diff_proc.stdout
-                    if run_tests and not commit_range:
+                    if run_tests and not validated_range:
                         test_result = self._run_readonly_pytest_on_branch(
-                            resolved.local_path, branch_ref, existing_worktree=None
+                            resolved.local_path, branch_ref
                         )
 
         pytest_exit = test_result["exit_code"] if test_result is not None else None
@@ -2166,6 +2405,10 @@ class CodingTaskService:
             mock_responder=lambda _m, _t: {"content": report.summary, "tool_calls": []},
         )
         provider_used = str(rot_res.get("provider", "mock:deterministic-simulator"))
+        live_summary = str(rot_res.get("content") or "").strip()
+        final_summary = report.summary
+        if live_summary and not provider_used.startswith("mock:") and live_summary != report.summary:
+            final_summary = f"{report.summary} [LLM Reviewer ({provider_used}): {live_summary}]"
 
         self._emit(
             {
@@ -2186,7 +2429,7 @@ class CodingTaskService:
             "target": target_label,
             "decision": report.decision,
             "score": report.score,
-            "summary": report.summary,
+            "summary": final_summary,
             "findings": [f.to_dict() for f in report.findings],
             "diff_stats": report.diff_stats.to_dict(),
             "test_result": test_result,

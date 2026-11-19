@@ -5,9 +5,12 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
     HOST=0.0.0.0 \
     PORT=8000 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    GIT_TERMINAL_PROMPT=0 \
+    GCM_INTERACTIVE=never
 
 # Git is required for isolated worktrees, internal GitLab clone/push, and diff review.
 # ca-certificates allows mounting corporate root CAs via INTERNAL_GIT_CA_BUNDLE.
@@ -38,4 +41,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS http://127.0.0.1:${PORT}/healthz || exit 1
 
-CMD ["sh", "-c", "uvicorn app.main:app --host ${HOST} --port ${PORT}"]
+CMD ["sh", "-c", "exec uvicorn app.main:app --host \"${HOST}\" --port \"${PORT}\""]

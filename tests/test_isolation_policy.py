@@ -88,3 +88,89 @@ def test_check_4_command_shape_blocks_dynamic_expansion(tmp_path: Path) -> None:
     assert policy.validate_command_shape("${!indirect_var} status").allowed is False
     assert policy.validate_command_shape("git `cat target_cmd`").allowed is False
     assert policy.validate_command_shape("git $(echo status)").allowed is False
+
+
+def test_check_1_blocks_git_directory_internals_config_and_hooks(tmp_path: Path) -> None:
+    main_repo = tmp_path / "repo"
+    wt_dir = main_repo / ".abyss" / "worktrees" / "worker-1"
+    (wt_dir / ".git" / "hooks").mkdir(parents=True)
+
+    policy = WorktreeIsolationPolicy(worktree_root=wt_dir, main_checkout_root=main_repo)
+
+    for rel in (".git/config", ".git/hooks/pre-commit"):
+        verdict = policy.validate_file_edit(rel)
+        assert verdict.allowed is False
+        assert verdict.check_name == "file_edit"
+
+
+def test_check_3_blocks_multi_segment_global_flag_attached_c_and_cd_pushd_escapes(
+    tmp_path: Path,
+) -> None:
+    main_repo = tmp_path / "repo"
+    wt_dir = main_repo / ".abyss" / "worktrees" / "worker-1"
+    wt_dir.mkdir(parents=True)
+
+    policy = WorktreeIsolationPolicy(worktree_root=wt_dir, main_checkout_root=main_repo)
+
+    blocked_cmds = [
+        f"git -C . status && git -C {main_repo} reset --hard",
+        f"git --no-pager -C {main_repo} status",
+        f"git -C{main_repo} status",
+        "cd ~/repo && git status",
+        "cd && pwd",
+        "cd -- ../ && git status",
+        "cd $HOME && pwd",
+        "pushd ../ && pwd",
+    ]
+    for cmd in blocked_cmds:
+        verdict = policy.validate_git_redirect(cmd)
+        assert verdict.allowed is False, f"Expected Check #3 block for: {cmd!r}"
+        assert verdict.check_name == "git_redirect"
+
+
+def test_check_4_blocks_general_command_and_process_substitution(tmp_path: Path) -> None:
+    main_repo = tmp_path / "repo"
+    wt_dir = main_repo / ".abyss" / "worktrees" / "worker-1"
+    wt_dir.mkdir(parents=True)
+
+    policy = WorktreeIsolationPolicy(worktree_root=wt_dir, main_checkout_root=main_repo)
+
+    blocked_cmds = [
+        "echo $(id)",
+        "cd $(echo /etc) && cat passwd",
+        "$(echo git) status",
+        'python -m app --arg "x $(touch /tmp/x)"',
+        "cat <(cat ../../.env)",
+    ]
+    for cmd in blocked_cmds:
+        verdict = policy.validate_command_shape(cmd)
+        assert verdict.allowed is False, f"Expected Check #4 block for: {cmd!r}"
+        assert verdict.check_name == "command_shape"
+
+
+def test_permission_rules_blocks_quoted_env_escapes_wrappers_and_normalized_paths() -> None:
+    from app.domains.guardrails.permissions import PermissionRules
+
+    rules = PermissionRules.default()
+    denied_bash_cmds = [
+        'cd \'app\' && FOO=1 BAR="a && b" git push origin main',
+        'FOO="hello world" git push origin main',
+        'echo "\\"" && git push origin main',
+        'echo \\" && git push origin main',
+        "(git push origin main)",
+        "{ git push origin main; }",
+        "env git push origin main",
+        "command git push origin main",
+        "/usr/bin/git push origin main",
+        "\\git push origin main",
+        "'git' push origin main",
+        "git  push origin main",
+        "rm -fr /",
+        "rm -r -f /",
+    ]
+    for cmd in denied_bash_cmds:
+        verdict = rules.evaluate("Bash", cmd)
+        assert verdict.decision == "deny", f"Expected deny for {cmd!r}, got {verdict}"
+
+    assert rules.evaluate("Read", "sub/../.env").decision == "deny"
+    assert rules.evaluate("Write", "sub/../.env").decision == "deny"

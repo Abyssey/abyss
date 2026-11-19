@@ -9,6 +9,7 @@ eliminating stale `demo_workspace` `sys.modules` imports and guaranteeing tempor
 from __future__ import annotations
 
 import asyncio
+import threading
 from typing import Any
 
 from app.core.config import AppSettings, load_settings
@@ -27,7 +28,13 @@ class OnboardingService:
         self.git_resolver = InternalGitSourceResolver(self.settings)
         self.analyzer = RepoAnalyzer()
         self.tutor = SocraticOnboardingTutor()
-        self._cached_package: dict[str, Any] | None = None
+        self._cache_lock = threading.Lock()
+        self._cached_packages: dict[str, dict[str, Any]] = {}
+        self._last_cache_key: str | None = None
+
+    def _cache_key(self, repo_url_or_path: str) -> str:
+        resolved_target, source_type, _ = self.git_resolver.resolve_target_spec(repo_url_or_path)
+        return f"{source_type}:{resolved_target}"
 
     def sanitize_error(self, exc: Exception) -> str:
         secrets = (self.settings.internal_gitlab_token,) if self.settings.internal_gitlab_token else ()
@@ -35,6 +42,7 @@ class OnboardingService:
 
     def _analyze_sync(self, repo_url_or_path: str) -> dict[str, Any]:
         secrets = (self.settings.internal_gitlab_token,) if self.settings.internal_gitlab_token else ()
+        key = self._cache_key(repo_url_or_path)
         with self.git_resolver.checkout(repo_url_or_path, shallow=True) as resolved:
             analysis = self.analyzer.analyze_directory(
                 resolved.local_path,
@@ -51,7 +59,13 @@ class OnboardingService:
                 "onboarding_brief": tutor_pkg["onboarding_brief"],
                 "socratic_ladder": tutor_pkg["socratic_ladder"],
             }
-            self._cached_package = combined
+            with self._cache_lock:
+                self._cached_packages[key] = combined
+                if len(self._cached_packages) > 16:
+                    oldest_key = next(iter(self._cached_packages))
+                    if oldest_key != key:
+                        self._cached_packages.pop(oldest_key, None)
+                self._last_cache_key = key
             return combined
 
     async def analyze(self, repo_url_or_path: str) -> dict[str, Any]:
@@ -64,10 +78,22 @@ class OnboardingService:
         selected_index: int,
         reflection: str = "",
     ) -> dict[str, Any]:
-        if self._cached_package is None:
-            await self.analyze(repo_url_or_path or "self")
-        assert self._cached_package is not None
-        ladder = self._cached_package.get("socratic_ladder", [])
+        target = (repo_url_or_path or "").strip()
+        package: dict[str, Any] | None = None
+        if target:
+            key = self._cache_key(target)
+            with self._cache_lock:
+                package = self._cached_packages.get(key)
+            if package is None:
+                package = await self.analyze(target)
+        else:
+            with self._cache_lock:
+                if self._last_cache_key is not None:
+                    package = self._cached_packages.get(self._last_cache_key)
+            if package is None:
+                package = await self.analyze("self")
+
+        ladder = package.get("socratic_ladder", [])
         if not ladder:
             raise ValueError("No Socratic questions available for the analyzed repository.")
         question = next((q for q in ladder if q["id"] == question_id), ladder[0])

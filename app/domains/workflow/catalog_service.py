@@ -31,7 +31,7 @@ class ArchitectureCatalogService:
                 "why_different": (
                     "가벼운 Git Worktree(`.abyss/worktrees/<id>`)로 브랜치와 작업 트리를 분리하되, 도구 실행 직전에 "
                     "① File Edit Path(`is_relative_to`, 심볼릭 링크·`../` 차단) ② Command CWD ③ Git Redirect(`git -C`, `--git-dir`, `cd ..`) "
-                    "④ Dynamic Command Shape(`${!var}`, `eval`, 백틱, `git $(...)`) 4가지 결정론적 정책을 순수 파이썬 표준 라이브러리로 강제합니다."
+                    "④ Dynamic Command Shape(`${!var}`, `eval`, 백틱, `$(...)`) 4가지 결정론적 정책을 순수 파이썬 표준 라이브러리로 강제합니다."
                 ),
                 "ownership": "★ Focus Domain #1 · Guardrails (Pure Stdlib)",
             },
@@ -94,7 +94,7 @@ class ArchitectureCatalogService:
         infra_files: list[dict[str, Any]] = [
             {
                 "file_path": "app/domains/workflow/worktree_adapter.py",
-                "role": "Git Worktree 생성·Lock·Merge 및 오프라인 Bare Remote / Safe Push 어댑터 (Workflow Domain)",
+                "role": "Git Worktree 생성·Lock·Merge 및 오프라인 테스트용 로컬 원격 / Safe Push 어댑터 (Workflow Domain)",
                 "ownership": "Workflow Domain · Git Adapter",
             },
             {

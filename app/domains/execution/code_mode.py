@@ -202,9 +202,37 @@ _FORBIDDEN_NAMES = frozenset(
     {
         "eval", "exec", "compile", "open", "__import__", "globals", "locals", "vars",
         "getattr", "setattr", "delattr", "breakpoint", "input", "exit", "quit", "help",
-        "memoryview", "type", "object", "super", "classmethod", "staticmethod",
+        "memoryview", "type", "object", "super", "classmethod", "staticmethod", "format",
     }
 )
+_FORBIDDEN_ATTRS = frozenset({"format", "format_map"})
+_SENSITIVE_ENV_KEY_RE = re.compile(
+    r"(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL"
+    r"|^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$)",
+    re.IGNORECASE,
+)
+
+
+class _ToolProxy:
+    """Callable proxy that exposes no __globals__ or internal attributes to REPL code."""
+
+    __slots__ = ("_name", "_fn")
+
+    def __init__(self, name: str, fn: Callable[..., Any]) -> None:
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_fn", fn)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return object.__getattribute__(self, "_fn")(*args, **kwargs)
+
+    def __repr__(self) -> str:
+        tool_name = object.__getattribute__(self, "_name")
+        return f"<code-mode tool {tool_name}>"
+
+    def __getattribute__(self, name: str) -> Any:
+        raise AttributeError(
+            f"Attribute access '{name}' is not permitted on Code Mode tool proxy."
+        )
 
 
 class _CodeReviewer(ast.NodeVisitor):
@@ -232,6 +260,11 @@ class _CodeReviewer(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr.startswith("_"):
             self._flag(node, f"private/dunder attribute access '.{node.attr}' is not allowed.")
+        elif node.attr in _FORBIDDEN_ATTRS:
+            self._flag(
+                node,
+                f"attribute/method '.{node.attr}' is not allowed in Code Mode — use f-strings instead.",
+            )
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
@@ -240,19 +273,40 @@ class _CodeReviewer(ast.NodeVisitor):
 
 
 class _BudgetInjector(ast.NodeTransformer):
-    """모든 for/while/함수 본문 맨 앞에 `__abyss_tick__()`를 넣어 무한 루프를 차단합니다."""
+    """모든 루프/함수/컴프리헨션·제너레이터에 `__abyss_tick__()`를 넣어 무한 루프/CPU DoS를 차단합니다."""
 
     @staticmethod
-    def _tick() -> ast.stmt:
-        return ast.Expr(value=ast.Call(func=ast.Name(id="__abyss_tick__", ctx=ast.Load()), args=[], keywords=[]))
+    def _tick_call() -> ast.Call:
+        return ast.Call(
+            func=ast.Name(id="__abyss_tick__", ctx=ast.Load()),
+            args=[],
+            keywords=[],
+        )
+
+    def _tick_stmt(self) -> ast.stmt:
+        return ast.Expr(value=self._tick_call())
+
+    def _tick_guard(self) -> ast.expr:
+        return ast.Compare(
+            left=self._tick_call(),
+            ops=[ast.Is()],
+            comparators=[ast.Constant(value=None)],
+        )
 
     def _inject(self, node: Any) -> Any:
         self.generic_visit(node)
-        node.body.insert(0, self._tick())
+        node.body.insert(0, self._tick_stmt())
+        return node
+
+    def _inject_comp(self, node: Any) -> Any:
+        self.generic_visit(node)
+        for gen in node.generators:
+            gen.ifs.insert(0, self._tick_guard())
         return node
 
     visit_For = visit_AsyncFor = visit_While = _inject
     visit_FunctionDef = visit_AsyncFunctionDef = _inject
+    visit_ListComp = visit_SetComp = visit_DictComp = visit_GeneratorExp = _inject_comp
 
 
 def compile_program(code: str) -> Any:
@@ -304,21 +358,55 @@ class _RunContext:
 
         # ② Worktree 격리 정책 (경로 기반 — 런타임 조합 경로 및 우회 차단)
         if tool == "Bash":
-            virtual_cwd = ex.worktree_root / args["cwd"] if args.get("cwd") else ex.worktree_root
-            for seg in split_compound_command(args.get("command", "")):
+            raw_command = str(args.get("command", ""))
+            raw_cwd = args.get("cwd")
+            cwd_verdict = ex.policy.validate_command_cwd(raw_cwd)
+            if not cwd_verdict.allowed:
+                return False, f"isolation:{cwd_verdict.check_name}", cwd_verdict.reason
+
+            shape_verdict = ex.policy.validate_command_shape(raw_command)
+            if not shape_verdict.allowed:
+                return False, f"isolation:{shape_verdict.check_name}", shape_verdict.reason
+
+            segments = split_compound_command(raw_command)
+            if not segments:
+                return (
+                    False,
+                    "isolation:command_shape",
+                    "Empty or operator-only command is not allowed.",
+                )
+
+            virtual_cwd = ex.resolve(raw_cwd) if raw_cwd else ex.worktree_root
+            for seg in segments:
                 verdict = ex.policy.validate_shell_command(seg, cwd=virtual_cwd)
                 if not verdict.allowed:
                     return False, f"isolation:{verdict.check_name}", verdict.reason
-                m = re.match(r"^cd\s+(['\"]?)([^'\"]+)\1\s*$", seg)
+                m = re.match(r"^cd\s+(?:--\s+)?(['\"]?)([^'\"\s]+)\1\s*$", seg.strip())
                 if m:
-                    virtual_cwd = (virtual_cwd / m.group(2)).resolve()
+                    next_cwd = (virtual_cwd / m.group(2)).resolve()
+                    if not next_cwd.is_relative_to(ex.worktree_root):
+                        return (
+                            False,
+                            "isolation:git_redirect",
+                            f"Blocked 'cd {m.group(2)}' resolving outside worktree '{ex.worktree_root}'.",
+                        )
+                    virtual_cwd = next_cwd
         elif tool in ("Edit", "Write"):
             verdict = ex.policy.validate_file_edit(args.get("path", ""))
             if not verdict.allowed:
                 return False, f"isolation:{verdict.check_name}", verdict.reason
         else:
-            if not ex.resolve(args.get("path", ".")).is_relative_to(ex.worktree_root):
-                return False, "isolation:read_confinement", f"Read outside worktree: {args.get('path')}"
+            verdict = ex.policy.validate_file_read(args.get("path", "."))
+            if not verdict.allowed:
+                return False, f"isolation:{verdict.check_name}", verdict.reason
+            if tool == "Glob":
+                pat = str(args.get("pattern", "**/*"))
+                if Path(pat).is_absolute() or ".." in Path(pat).parts:
+                    return (
+                        False,
+                        "isolation:read_confinement",
+                        f"Glob pattern outside worktree: {pat!r}",
+                    )
 
         # ③ PreToolUse 훅 (timeout · onFailure)
         ok, who, why = await ex.run_hooks(tool, args)
@@ -423,8 +511,11 @@ class CodeModeExecutor:
         ex = self
 
         def _env() -> dict[str, str]:
-            env = os.environ.copy()
+            env = {k: v for k, v in os.environ.items() if not _SENSITIVE_ENV_KEY_RE.search(k)}
             env["PYTHONPATH"] = str(ex.worktree_root)
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            env["GCM_INTERACTIVE"] = "never"
             env["PATH"] = f"{Path(sys.executable).parent}:{env.get('PATH', '')}"
             return env
 
@@ -456,7 +547,10 @@ class CodeModeExecutor:
                 base = ex.resolve(path)
                 return sorted(
                     str(p.relative_to(ex.worktree_root)) for p in base.glob(pattern)
-                    if p.is_file() and ".git" not in p.parts and "__pycache__" not in p.parts
+                    if p.is_file()
+                    and p.resolve().is_relative_to(ex.worktree_root)
+                    and ".git" not in p.parts
+                    and "__pycache__" not in p.parts
                 )[:500]
             return await ctx.call("Glob", {"path": path, "pattern": pattern}, impl)
 
@@ -501,13 +595,18 @@ class CodeModeExecutor:
                 "RuntimeError", "TimeoutError", "StopIteration",
             )
         }
-        safe.update(print=_print, range=_range)
+        safe.update(print=_ToolProxy("print", _print), range=_ToolProxy("range", _range))
         return {
             "__builtins__": safe,
-            "__abyss_tick__": ctx.tick,
-            "sh": sh, "read": read, "ls": ls, "write": write, "edit": edit, "gather": gather,
-            "to_json": lambda v: json.dumps(v, ensure_ascii=False, default=str),
-            "from_json": json.loads,
+            "__abyss_tick__": _ToolProxy("__abyss_tick__", ctx.tick),
+            "sh": _ToolProxy("sh", sh),
+            "read": _ToolProxy("read", read),
+            "ls": _ToolProxy("ls", ls),
+            "write": _ToolProxy("write", write),
+            "edit": _ToolProxy("edit", edit),
+            "gather": _ToolProxy("gather", gather),
+            "to_json": _ToolProxy("to_json", lambda v: json.dumps(v, ensure_ascii=False, default=str)),
+            "from_json": _ToolProxy("from_json", json.loads),
             "ToolRefused": ToolRefused, "CommandFailed": CommandFailed,
         }
 

@@ -6,10 +6,17 @@ Worktree-isolated Coding & Read-Only Reviewer Tools Adapter.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable
+
+_SENSITIVE_ENV_KEY_RE = re.compile(
+    r"(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL"
+    r"|^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$)",
+    re.IGNORECASE,
+)
 
 
 def build_agent_tools(
@@ -25,18 +32,35 @@ def build_agent_tools(
     OpenAI Function Calling 호환 JSON Schema를 생성하여 반환합니다.
     """
     wt_root = Path(worktree_root).resolve()
+    git_path = wt_root / ".git"
 
-    def _resolve_in_wt(rel_or_abs: str) -> Path:
+    def _resolve_confined(rel_or_abs: str, *, allow_root: bool = False) -> Path:
+        if "\x00" in rel_or_abs:
+            raise PermissionError("Null byte is not allowed in path.")
         p = Path(rel_or_abs)
-        return (wt_root / p).resolve() if not p.is_absolute() else p.resolve()
+        resolved = (wt_root / p).resolve() if not p.is_absolute() else p.resolve()
+        if not resolved.is_relative_to(wt_root):
+            raise PermissionError(
+                f"Blocked access outside isolated worktree '{wt_root}': {rel_or_abs!r}"
+            )
+        rel_parts = resolved.relative_to(wt_root).parts
+        if resolved == git_path or resolved.is_relative_to(git_path) or ".git" in rel_parts:
+            raise PermissionError(
+                f"Blocked direct access to git metadata inside worktree: {rel_or_abs!r}"
+            )
+        if not allow_root and resolved == wt_root:
+            raise PermissionError("Target path must refer to a file inside the worktree.")
+        return resolved
 
     def list_files(directory: str = ".") -> str:
-        target = _resolve_in_wt(directory)
+        target = _resolve_confined(directory, allow_root=True)
         if not target.exists():
             return f"Directory '{directory}' does not exist."
         items: list[str] = []
         for entry in sorted(target.rglob("*")):
             if ".git" in entry.parts or "__pycache__" in entry.parts:
+                continue
+            if not entry.resolve().is_relative_to(wt_root):
                 continue
             rel = entry.relative_to(wt_root)
             prefix = "[DIR] " if entry.is_dir() else "[FILE]"
@@ -44,7 +68,7 @@ def build_agent_tools(
         return "\n".join(items[:200]) if items else "(empty directory)"
 
     def read_file(path: str) -> str:
-        target = _resolve_in_wt(path)
+        target = _resolve_confined(path, allow_root=False)
         if not target.exists() or not target.is_file():
             return f"File '{path}' not found."
         content = target.read_text(encoding="utf-8", errors="replace")
@@ -53,13 +77,13 @@ def build_agent_tools(
         return "\n".join(numbered)
 
     def write_file(path: str, content: str) -> str:
-        target = _resolve_in_wt(path)
+        target = _resolve_confined(path, allow_root=False)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return f"Successfully wrote {len(content)} bytes to '{target.relative_to(wt_root)}'."
 
     def edit_file(path: str, old_text: str, new_text: str) -> str:
-        target = _resolve_in_wt(path)
+        target = _resolve_confined(path, allow_root=False)
         if not target.exists():
             return f"Error: File '{path}' does not exist."
         text = target.read_text(encoding="utf-8")
@@ -70,9 +94,12 @@ def build_agent_tools(
         return f"Updated '{target.relative_to(wt_root)}' successfully."
 
     def run_command(command: str, cwd: str | None = None) -> str:
-        exec_cwd = _resolve_in_wt(cwd) if cwd else wt_root
-        env = os.environ.copy()
+        exec_cwd = _resolve_confined(cwd, allow_root=True) if cwd else wt_root
+        env = {k: v for k, v in os.environ.items() if not _SENSITIVE_ENV_KEY_RE.search(k)}
         env["PYTHONPATH"] = str(exec_cwd)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GCM_INTERACTIVE"] = "never"
         venv_bin = str(Path(sys.executable).parent)
         env["PATH"] = f"{venv_bin}:{env.get('PATH', '')}"
         proc = subprocess.run(

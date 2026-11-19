@@ -32,6 +32,8 @@ def _make_isolated_test_app(tmp_path: Path):
 
 
 def test_presets_endpoint_exposes_5_canonical_korean_prompts(tmp_path: Path) -> None:
+    from app.domains.workflow.schemas import BuildTaskRequest
+
     test_app, _ = _make_isolated_test_app(tmp_path)
     with TestClient(test_app) as client:
         res = client.get("/api/workflow/tasks/presets")
@@ -39,9 +41,26 @@ def test_presets_endpoint_exposes_5_canonical_korean_prompts(tmp_path: Path) -> 
         data = res.json()
         prompts = data["storyline_prompts"]
         assert len(prompts) == 5
-        assert prompts[0]["prompt"] == "이 프로젝트 구조랑 핵심 파일들 쉽게 설명해줘"
-        assert prompts[1]["prompt"] == "이 프로젝트 구조 한눈에 보는 인터랙티브 웹 페이지 만들어줘"
+        assert [p["prompt"] for p in prompts] == [
+            "이 프로젝트 구조와 핵심 파일을 한눈에 정리해줘",
+            "이 프로젝트 지도를 클릭해서 볼 수 있는 웹페이지를 만들어줘",
+            "서비스 상태를 한눈에 보는 점검 대시보드 웹페이지를 만들어줘",
+            "에이전트가 main 브랜치에 push하거나 상위 비밀 파일을 건드리지 못하게 막아줘",
+            "방금 작업한 브랜치 코드에 보안 문제나 버그가 없는지 리뷰해줘",
+        ]
         assert data["build_presets"][0]["id"] == "project_map_app"
+        assert (
+            data["build_presets"][0]["instruction"]
+            == "이 프로젝트 지도를 클릭해서 볼 수 있는 웹페이지를 만들어줘"
+        )
+        assert (
+            data["build_presets"][1]["instruction"]
+            == "서비스 상태를 한눈에 보는 점검 대시보드 웹페이지를 만들어줘"
+        )
+        assert (
+            BuildTaskRequest().instruction
+            == "이 프로젝트 지도를 클릭해서 볼 수 있는 웹페이지를 만들어줘"
+        )
 
 
 def test_act2_project_map_build_live_preview_and_act4_clean_review(tmp_path: Path) -> None:
@@ -52,7 +71,7 @@ def test_act2_project_map_build_live_preview_and_act4_clean_review(tmp_path: Pat
             "/api/workflow/tasks/build",
             json={
                 "repo_url_or_path": "demo",
-                "instruction": "이 프로젝트 구조 한눈에 보는 인터랙티브 웹 페이지 만들어줘",
+                "instruction": "이 프로젝트 지도를 클릭해서 볼 수 있는 웹페이지를 만들어줘",
                 "preset": "project_map_app",
                 "use_code_mode": False,
                 "push_to_remote": True,
@@ -152,7 +171,7 @@ def test_act2_inspection_dashboard_with_code_mode_and_live_preview(tmp_path: Pat
             "/api/workflow/tasks/build",
             json={
                 "repo_url_or_path": "demo",
-                "instruction": "우리 서비스 상태 점검 대시보드 화면이랑 체크 코드 만들어줘",
+                "instruction": "서비스 상태를 한눈에 보는 점검 대시보드 웹페이지를 만들어줘",
                 "preset": "inspection_dashboard",
                 "use_code_mode": True,
                 "push_to_remote": True,
@@ -170,6 +189,11 @@ def test_act2_inspection_dashboard_with_code_mode_and_live_preview(tmp_path: Pat
         assert prev.status_code == 200
         assert "Re-run Health Check" in prev.text
         assert "Service Inspection Dashboard" in prev.text
+        assert "generated_at" in prev.text
+        assert "스냅샷 기준 재검증 완료" in prev.text
+        assert "python -m inspection_dashboard.checker" in prev.text
+        assert "runCount % 3" not in prev.text
+        assert "latency_ms = Math.max" not in prev.text
 
 
 def test_act2_build_against_self_scans_real_modern_ddd_without_mutating_repo(tmp_path: Path) -> None:
@@ -242,3 +266,199 @@ new file mode 100644
         assert raw_rev["score"] < 60
         assert any(f["file"] == "billing/charge.py" and f["line"] == 1 for f in raw_rev["findings"])
         assert any("eval" in f["comment"] for f in raw_rev["findings"])
+
+
+def test_act2_build_instruction_prevents_shell_injection_env_leak_and_backtick_crash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("PROBE_SECRET_SENTINEL", "SECRET_POD_999888")
+    marker = tmp_path / "rce_marker_should_not_exist"
+    malicious_instruction = (
+        f'Map $(touch {marker} && echo $PROBE_SECRET_SENTINEL) '
+        f'$PROBE_SECRET_SENTINEL $100 `README.md`'
+    )
+
+    test_app, _ = _make_isolated_test_app(tmp_path)
+    with TestClient(test_app) as client:
+        for preset, use_cm in (("project_map_app", False), ("inspection_dashboard", True)):
+            res = client.post(
+                "/api/workflow/tasks/build",
+                json={
+                    "repo_url_or_path": "demo",
+                    "instruction": malicious_instruction,
+                    "preset": preset,
+                    "use_code_mode": use_cm,
+                    "push_to_remote": False,
+                },
+            )
+            assert res.status_code == 200, res.text
+            b = res.json()
+            assert b["status"] == "completed"
+            assert not marker.exists(), "Shell injection executed via build instruction!"
+            assert "SECRET_POD_999888" not in b["git_diff"]
+            prev = client.get(b["preview_url"])
+            assert prev.status_code == 200
+            assert "SECRET_POD_999888" not in prev.text
+
+
+def test_act4_review_rejects_git_flag_injection_in_commit_range_and_branches(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "git_output_pwned.txt"
+    test_app, _ = _make_isolated_test_app(tmp_path)
+    with TestClient(test_app) as client:
+        bad_payloads = [
+            {"repo_url_or_path": "demo", "commit_range": f"--output={marker}", "run_tests": False},
+            {"repo_url_or_path": "demo", "commit_range": "--stat", "run_tests": False},
+            {"repo_url_or_path": "demo", "branch_name": "--upload-pack=id", "run_tests": False},
+            {"repo_url_or_path": "demo", "base_branch": "-c foo=bar", "run_tests": False},
+        ]
+        for payload in bad_payloads:
+            res = client.post("/api/workflow/tasks/review", json=payload)
+            assert res.status_code == 400, f"Expected 400 for {payload}, got {res.status_code}"
+        assert not marker.exists()
+
+
+def test_act4_review_catches_prefixed_secret_vars_and_bare_except_variants(tmp_path: Path) -> None:
+    test_app, _ = _make_isolated_test_app(tmp_path)
+    tricky_diff = """diff --git a/service/auth.py b/service/auth.py
+new file mode 100644
+--- /dev/null
++++ b/service/auth.py
+@@ -0,0 +1,19 @@
++GITHUB_TOKEN = "corp_internal_secret_987654321"
++SERVICE_API_KEY = "prod-key-abcdef9999"
++MYSQL_DB_PASSWORD = "super_secret_pw_123"
++
++def parse_one(x: str) -> str:
++    try:
++        return x.strip()
++    except:
++        # ignore
++        pass
++    return ""
++
++def parse_two(x: str):
++    try:
++        return int(x)
++    except:
++        return None
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_auth.py
+@@ -0,0 +1,2 @@
++def test_dummy():
++    assert True
+"""
+    with TestClient(test_app) as client:
+        res = client.post("/api/workflow/tasks/review", json={"raw_diff": tricky_diff})
+        assert res.status_code == 200
+        rev = res.json()
+        assert rev["decision"] == "REQUEST_CHANGES"
+        assert rev["score"] < 80
+        secret_lines = {f["line"] for f in rev["findings"] if "비밀키" in f["comment"] or "하드코딩" in f["comment"]}
+        assert {1, 2, 3}.issubset(secret_lines)
+        except_lines = {f["line"] for f in rev["findings"] if "except" in f["comment"]}
+        assert len(except_lines) >= 2
+
+        # Clean safe diff (TOKEN_TYPE = "Bearer" + logged exception) must APPROVE with 0 findings
+        clean_diff = """diff --git a/service/safe.py b/service/safe.py
+new file mode 100644
+--- /dev/null
++++ b/service/safe.py
+@@ -0,0 +1,9 @@
++TOKEN_TYPE = "Bearer"
++
++def safe_parse(x: str) -> int:
++    try:
++        return int(x)
++    except ValueError:
++        return 0
+diff --git a/tests/test_safe.py b/tests/test_safe.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_safe.py
+@@ -0,0 +1,2 @@
++def test_safe():
++    assert True
+"""
+        res_clean = client.post("/api/workflow/tasks/review", json={"raw_diff": clean_diff})
+        assert res_clean.status_code == 200
+        clean_rev = res_clean.json()
+        assert clean_rev["decision"] == "APPROVE"
+        assert clean_rev["findings"] == []
+
+
+def test_preview_sets_csp_sandbox_nosniff_and_escapes_custom_preset_xss_filenames(
+    tmp_path: Path,
+) -> None:
+    xss_folder = tmp_path / "xss_project"
+    xss_folder.mkdir()
+    (xss_folder / "<img src=x onerror=alert(1)>.py").write_text("X = 1\n", encoding="utf-8")
+
+    test_app, _ = _make_isolated_test_app(tmp_path)
+    with TestClient(test_app) as client:
+        res = client.post(
+            "/api/workflow/tasks/build",
+            json={
+                "repo_url_or_path": str(xss_folder),
+                "instruction": "XSS escape check",
+                "preset": "custom",
+                "push_to_remote": False,
+            },
+        )
+        assert res.status_code == 200, res.text
+        b = res.json()
+        assert b["status"] == "completed"
+        prev = client.get(b["preview_url"])
+        assert prev.status_code == 200
+        csp = prev.headers.get("content-security-policy", "")
+        assert "sandbox" in csp and "allow-scripts" in csp
+        assert prev.headers.get("x-content-type-options") == "nosniff"
+        assert '"<li>" + f + "</li>"' not in prev.text
+        assert "esc(f)" in prev.text
+
+
+def test_build_commits_no_pyc_preserves_repo_name_and_survives_copystat_eperm(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import shutil
+    from app.domains.workflow.schemas import BuildTaskRequest
+
+    named_folder = tmp_path / "billing_portal_demo"
+    named_folder.mkdir()
+    (named_folder / "ledger.py").write_text(
+        '"""Ledger engine."""\ndef balance() -> int:\n    return 100\n', encoding="utf-8"
+    )
+
+    def _forbid_copy2(*_args, **_kwargs):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(shutil, "copy2", _forbid_copy2)
+
+    req_model = BuildTaskRequest(base_branch="main")
+    assert req_model.base_branch == "main"
+
+    test_app, _ = _make_isolated_test_app(tmp_path)
+    with TestClient(test_app) as client:
+        res = client.post(
+            "/api/workflow/tasks/build",
+            json={
+                "repo_url_or_path": str(named_folder),
+                "instruction": "빌링 포털 지도 만들어줘",
+                "preset": "project_map_app",
+                "base_branch": "main",
+                "push_to_remote": False,
+            },
+        )
+        assert res.status_code == 200, res.text
+        b = res.json()
+        assert b["status"] == "completed"
+        assert all(
+            not f.endswith(".pyc") and "__pycache__" not in f and ".pytest_cache" not in f
+            for f in b["changed_files"]
+        )
+        prev = client.get(b["preview_url"])
+        assert prev.status_code == 200
+        assert "<title>billing_portal_demo — Interactive Project Map</title>" in prev.text

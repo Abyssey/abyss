@@ -12,6 +12,7 @@ Git Worktree Isolation, Internal Bare Remote Fixture & Safe Branch Push Adapter.
 from __future__ import annotations
 
 import fnmatch
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -59,9 +60,14 @@ class GitWorktreeManager:
 
     def _run_git(self, args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         target_cwd = cwd or self.repo_root
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GCM_INTERACTIVE"] = "never"
+        env["GIT_ASKPASS"] = ""
         return subprocess.run(
             ["git", *args],
             cwd=str(target_cwd),
+            env=env,
             capture_output=True,
             text=True,
             check=False,
@@ -170,9 +176,18 @@ class GitWorktreeManager:
             for pat in patterns:
                 if fnmatch.fnmatch(candidate.name, pat) and candidate.is_file():
                     dest = wt_path / candidate.name
-                    shutil.copy2(candidate, dest)
+                    shutil.copyfile(candidate, dest)
                     copied.append(candidate.name)
         return copied
+
+    @staticmethod
+    def _validate_branch_token(value: str, label: str) -> str:
+        if any(ch in value for ch in ("\r", "\n", "\x00")):
+            raise ValueError(f"Invalid {label}: contains control characters")
+        cleaned = value.strip()
+        if not cleaned or cleaned.startswith("-") or any(ch.isspace() for ch in cleaned):
+            raise ValueError(f"Invalid {label}: {cleaned!r}")
+        return cleaned
 
     def create_worktree(
         self,
@@ -184,10 +199,12 @@ class GitWorktreeManager:
         에이전트/태스크 전용 Git Worktree(`.abyss/worktrees/<agent_id>`)와
         전용 브랜치(기본 `worktree-<agent_id>`, 지정 시 예: `agent/task-<id>`)를 생성하고 Lock을 설정합니다.
         """
-        base = base_branch or self.get_default_branch()
-        target_branch = (branch_name or f"worktree-{agent_id}").strip()
-        if target_branch.startswith("-") or any(ch in target_branch for ch in ("\r", "\n", "\x00")):
-            raise ValueError(f"Invalid branch name: {target_branch!r}")
+        base = self._validate_branch_token(
+            base_branch or self.get_default_branch(), "base_branch"
+        )
+        target_branch = self._validate_branch_token(
+            branch_name or f"worktree-{agent_id}", "branch_name"
+        )
 
         wt_path = self.worktrees_dir / agent_id
 
@@ -223,9 +240,20 @@ class GitWorktreeManager:
         self.worktrees[agent_id] = info
         return info
 
+    @staticmethod
+    def _cleanup_ephemeral_artifacts(wt_path: Path) -> None:
+        """Remove Python/pytest ephemeral cache files before staging worktree commits."""
+        for cache_dir in list(wt_path.rglob("__pycache__")) + list(wt_path.rglob(".pytest_cache")):
+            if ".git" not in cache_dir.parts and cache_dir.is_dir():
+                shutil.rmtree(cache_dir, ignore_errors=True)
+        for pyc in list(wt_path.rglob("*.pyc")) + list(wt_path.rglob("*.pyo")):
+            if ".git" not in pyc.parts and pyc.is_file():
+                pyc.unlink(missing_ok=True)
+
     def commit_worktree_changes(self, agent_id: str, commit_message: str) -> str:
         """Worktree 내의 변경 사항을 해당 에이전트 브랜치에 커밋합니다."""
         info = self.worktrees[agent_id]
+        self._cleanup_ephemeral_artifacts(info.worktree_path)
         self._run_git(["add", "-A"], cwd=info.worktree_path)
         status_res = self._run_git(["status", "--porcelain"], cwd=info.worktree_path)
         if status_res.stdout.strip():
@@ -242,19 +270,23 @@ class GitWorktreeManager:
         info = self.worktrees.get(agent_id)
         if not info:
             return ""
-        diff_res = self._run_git(["diff", f"{info.base_branch}...{info.branch_name}"])
+        diff_res = self._run_git(
+            ["diff", "--end-of-options", f"{info.base_branch}...{info.branch_name}", "--"]
+        )
         if not diff_res.stdout.strip():
-            diff_res = self._run_git(["diff", "HEAD"], cwd=info.worktree_path)
+            diff_res = self._run_git(["diff", "--end-of-options", "HEAD", "--"], cwd=info.worktree_path)
         return diff_res.stdout
 
     def get_branch_diff(self, base_branch: str, branch_name: str) -> str:
         """임의의 두 브랜치(`base_branch...branch_name`) 사이의 unified diff를 반환합니다."""
-        res = self._run_git(["diff", f"{base_branch}...{branch_name}"])
+        res = self._run_git(["diff", "--end-of-options", f"{base_branch}...{branch_name}", "--"])
         return res.stdout
 
     def get_branch_changed_files(self, base_branch: str, branch_name: str) -> list[str]:
         """베이스 브랜치 대비 대상 브랜치에서 변경된 파일 상대 경로 목록을 반환합니다."""
-        res = self._run_git(["diff", "--name-only", f"{base_branch}...{branch_name}"])
+        res = self._run_git(
+            ["diff", "--name-only", "--end-of-options", f"{base_branch}...{branch_name}", "--"]
+        )
         return [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
 
     def merge_worktree_branch(self, agent_id: str) -> dict[str, Any]:

@@ -141,17 +141,53 @@ class EvaluatorRubric:
 
     # Act 4 정적 보안/품질 규칙 패턴
     _SECRET_ASSIGN_RE = re.compile(
-        r"""\b(?:API_SECRET|API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|DB_PASSWORD|PASSWORD|TOKEN)\b\s*=\s*["']([^"']{6,})["']""",
+        r"""\b[A-Za-z0-9_]*(?:API_SECRET|API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|DB_PASSWORD|PASSWORD|PASSWD|SECRET|TOKEN)\b(?:\s*:\s*[^=\n]+)?\s*=\s*["']([^"']{6,})["']""",
+        re.IGNORECASE,
+    )
+    _SECRET_PLACEHOLDER_RE = re.compile(
+        r"^(?:\*+|REDACTED|CHANGEME|CHANGE_ME|<[^>]+>|\$\{[^}]+\}|placeholder|example)$",
         re.IGNORECASE,
     )
     _SECRET_LITERAL_RE = re.compile(
         r"""["'](?:sk-[A-Za-z0-9_-]{6,}|fake-token-[A-Za-z0-9_-]{6,}|AIza[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{12,})["']"""
     )
-    _BARE_EXCEPT_PASS_INLINE_RE = re.compile(r"^\s*except(?:\s+Exception(?:\s+as\s+\w+)?)?\s*:\s*pass\b")
-    _BARE_EXCEPT_HEADER_RE = re.compile(r"^\s*except(?:\s+Exception(?:\s+as\s+\w+)?)?\s*:\s*(?:#.*)?$")
-    _PASS_ONLY_RE = re.compile(r"^\s*pass\s*(?:#.*)?$")
+    _BARE_EXCEPT_PASS_INLINE_RE = re.compile(
+        r"^\s*except(?:\s+Exception(?:\s+as\s+\w+)?)?\s*:\s*(?:pass\b|\.\.\.)"
+    )
+    _UNTYPED_BARE_EXCEPT_INLINE_RE = re.compile(
+        r"^\s*except\s*:\s*(?!\s*(?:#.*)?$)(?!\s*(?:pass\b|\.\.\.)).+"
+    )
+    _UNTYPED_BARE_EXCEPT_HEADER_RE = re.compile(r"^\s*except\s*:\s*(?:#.*)?$")
+    _BROAD_EXCEPT_HEADER_RE = re.compile(r"^\s*except\s+Exception(?:\s+as\s+\w+)?\s*:\s*(?:#.*)?$")
+    _PASS_ONLY_RE = re.compile(r"^\s*(?:pass\b|\.\.\.)\s*(?:#.*)?$")
     _EVAL_EXEC_RE = re.compile(r"\b(?:eval|exec)\s*\(")
     _NOT_IMPL_RE = re.compile(r"^\s*raise\s+NotImplementedError\b")
+
+    @staticmethod
+    def _extract_pytest_failure_snippet(pytest_output: str, max_chars: int = 320) -> str:
+        if not pytest_output:
+            return ""
+        lines = [ln.rstrip() for ln in pytest_output.splitlines() if ln.strip()]
+        priority = [
+            ln.lstrip()
+            for ln in lines
+            if ln.lstrip().startswith(("FAILED ", "ERROR "))
+            or re.match(r"^\d+\s+failed\b", ln.lstrip())
+        ]
+        assertions = [
+            ln.lstrip()
+            for ln in lines
+            if ln.lstrip().startswith(("E   ", "AssertionError"))
+        ]
+        if priority or assertions:
+            return " | ".join(priority[:4] + assertions[:2])[:max_chars]
+        filtered = [
+            ln.strip()
+            for ln in lines
+            if "DeprecationWarning" not in ln and "warnings summary" not in ln.lower()
+        ]
+        fallback = " | ".join(filtered[-4:]) if filtered else pytest_output.strip()
+        return fallback[-max_chars:]
 
     def evaluate_worktree_submission(
         self,
@@ -180,7 +216,7 @@ class EvaluatorRubric:
                 comment=(
                     "Worktree 격리 환경에서 모든 pytest 스위트를 통과했습니다."
                     if tests_passed
-                    else f"pytest 실패 (exit_code={pytest_exit_code}): {pytest_output[-300:]}"
+                    else f"pytest 실패 (exit_code={pytest_exit_code}): {self._extract_pytest_failure_snippet(pytest_output, 300)}"
                 ),
             )
         )
@@ -348,8 +384,8 @@ class EvaluatorRubric:
     ) -> DiffReviewReport:
         """
         Act 4 독립 MR/브랜치 리뷰(`open-swe` Reviewer + `walkthrough` 가이드 diff 리뷰):
-        - 하드코딩된 API 키/시크릿 탐지 (High)
-        - 예외 삼킴 `except: pass` / `except Exception: pass` 탐지 (High)
+        - 하드코딩된 API 키/시크릿 탐지 (High, 접두사 포함 변수명·타입 어노테이션 지원)
+        - 예외 삼킴 `except: pass` / `except Exception: pass` 및 untyped bare `except:` 탐지 (High)
         - 위험한 `eval()` / `exec()` 탐지 (High)
         - 미구현 스텁 `raise NotImplementedError` 탐지 (Medium)
         - 프로덕션 `.py` 변경 대비 단위 테스트 누락 탐지 (Medium)
@@ -362,42 +398,76 @@ class EvaluatorRubric:
         reliability_high_count = 0
         craft_issue_count = 0
 
-        pending_bare_except: tuple[str, int] | None = None
+        # (file_path, except_line, is_untyped_bare, except_indent, last_seen_line)
+        pending_except: tuple[str, int, bool, int, int] | None = None
+
+        def _emit_except_swallow(f_path: str, f_line: int) -> None:
+            nonlocal reliability_high_count
+            reliability_high_count += 1
+            findings.append(
+                ReviewFindingItem(
+                    severity="high",
+                    file=f_path,
+                    line=f_line,
+                    comment=(
+                        "오류가 발생해도 아무 로그나 처리 없이 그냥 넘어가는 `except: pass` 패턴이 발견되었습니다. "
+                        "실제 서비스 장애 원인이 완전히 감춰져 디버깅이 불가능해집니다."
+                    ),
+                    suggestion=(
+                        "구체적인 예외 타입(예: `except ValueError as exc:`)만 잡고, "
+                        "로깅(`logger.warning(...)`) 또는 안전한 에러 상태 응답을 반환하도록 수정하세요."
+                    ),
+                )
+            )
+
+        def _emit_untyped_bare_except(f_path: str, f_line: int) -> None:
+            nonlocal reliability_high_count
+            reliability_high_count += 1
+            findings.append(
+                ReviewFindingItem(
+                    severity="high",
+                    file=f_path,
+                    line=f_line,
+                    comment=(
+                        "예외 타입을 지정하지 않은 `except:`(bare except) 구문이 발견되었습니다. "
+                        "`KeyboardInterrupt`·`SystemExit`·`MemoryError`까지 모두 가로채 예기치 않은 오동작과 장애 은폐를 유발합니다."
+                    ),
+                    suggestion=(
+                        "발생 가능한 구체적인 예외 타입(예: `except (ValueError, KeyError) as exc:`)을 명시하고 "
+                        "원인을 로깅한 뒤 안전하게 처리하세요."
+                    ),
+                )
+            )
 
         for file_path, line_no, text in added_entries:
             is_test = self._is_test_file(file_path)
             is_python = file_path.endswith(".py")
             stripped = text.strip()
+            indent = len(text) - len(text.lstrip(" \t"))
 
-            # 직전 줄이 `except:` 헤더였고 현재 줄이 `pass`인 경우 포착
-            if pending_bare_except is not None:
-                prev_file, prev_line = pending_bare_except
-                if prev_file == file_path and self._PASS_ONLY_RE.match(text):
-                    reliability_high_count += 1
-                    findings.append(
-                        ReviewFindingItem(
-                            severity="high",
-                            file=file_path,
-                            line=prev_line,
-                            comment=(
-                                "오류가 발생해도 아무 로그나 처리 없이 그냥 넘어가는 `except: pass` 패턴이 발견되었습니다. "
-                                "실제 서비스 장애 원인이 완전히 감춰져 디버깅이 불가능해집니다."
-                            ),
-                            suggestion=(
-                                "구체적인 예외 타입(예: `except ValueError as exc:`)만 잡고, "
-                                "로깅(`logger.warning(...)`) 또는 안전한 에러 상태 응답을 반환하도록 수정하세요."
-                            ),
-                        )
-                    )
-                    pending_bare_except = None
+            # 직전 줄(또는 공백/주석 이전)이 `except:` / `except Exception:` 헤더였던 경우 상태 전이
+            if pending_except is not None:
+                p_file, p_line, p_untyped, p_indent, p_last = pending_except
+                contiguous = p_file == file_path and line_no == p_last + 1
+                if contiguous and (not stripped or stripped.startswith("#")):
+                    pending_except = (p_file, p_line, p_untyped, p_indent, line_no)
                     continue
-                pending_bare_except = None
+                if contiguous and indent > p_indent and self._PASS_ONLY_RE.match(text):
+                    _emit_except_swallow(p_file, p_line)
+                    pending_except = None
+                    continue
+                if p_untyped:
+                    _emit_untyped_bare_except(p_file, p_line)
+                pending_except = None
 
-            if not is_python or is_test or stripped.startswith("#"):
+            if not is_python or is_test or not stripped or stripped.startswith("#"):
                 continue
 
             # 1) 하드코딩된 API 키 / 시크릿 검사
-            secret_match = self._SECRET_ASSIGN_RE.search(text) or self._SECRET_LITERAL_RE.search(text)
+            assign_match = self._SECRET_ASSIGN_RE.search(text)
+            if assign_match and self._SECRET_PLACEHOLDER_RE.match(assign_match.group(1).strip()):
+                assign_match = None
+            secret_match = assign_match or self._SECRET_LITERAL_RE.search(text)
             if secret_match and "os.getenv" not in text and "os.environ" not in text:
                 security_high_count += 1
                 findings.append(
@@ -416,26 +486,15 @@ class EvaluatorRubric:
                     )
                 )
 
-            # 2) 한 줄 `except: pass` 검사
+            # 2) 한 줄/여러 줄 `except: pass` 및 untyped bare `except:` 검사
             if self._BARE_EXCEPT_PASS_INLINE_RE.match(text):
-                reliability_high_count += 1
-                findings.append(
-                    ReviewFindingItem(
-                        severity="high",
-                        file=file_path,
-                        line=line_no,
-                        comment=(
-                            "예외를 잡은 뒤 아무 처리 없이 무시하는 `except: pass` 구문입니다. "
-                            "네트워크/데이터 오류가 조용히 묻혀 장애를 키울 수 있습니다."
-                        ),
-                        suggestion=(
-                            "예상 가능한 예외만 명시적으로 처리하고, 실패 원인을 로그로 남기거나 "
-                            "호출자에게 명확한 에러 상태를 돌려주세요."
-                        ),
-                    )
-                )
-            elif self._BARE_EXCEPT_HEADER_RE.match(text):
-                pending_bare_except = (file_path, line_no)
+                _emit_except_swallow(file_path, line_no)
+            elif self._UNTYPED_BARE_EXCEPT_INLINE_RE.match(text):
+                _emit_untyped_bare_except(file_path, line_no)
+            elif self._UNTYPED_BARE_EXCEPT_HEADER_RE.match(text):
+                pending_except = (file_path, line_no, True, indent, line_no)
+            elif self._BROAD_EXCEPT_HEADER_RE.match(text):
+                pending_except = (file_path, line_no, False, indent, line_no)
 
             # 3) eval / exec 동적 실행 검사
             if self._EVAL_EXEC_RE.search(text):
@@ -466,6 +525,9 @@ class EvaluatorRubric:
                     )
                 )
 
+        if pending_except is not None and pending_except[2]:
+            _emit_untyped_bare_except(pending_except[0], pending_except[1])
+
         # 5) 프로덕션 파이썬 파일 변경 대비 테스트 파일 누락 검사
         prod_py_files = [
             f for f in diff_stats.files if f.endswith(".py") and not self._is_test_file(f) and not f.endswith("__init__.py")
@@ -495,13 +557,14 @@ class EvaluatorRubric:
         pytest_failed = pytest_exit_code is not None and pytest_exit_code != 0
         if pytest_failed:
             target_file = test_files[0] if test_files else (diff_stats.files[0] if diff_stats.files else "tests/")
+            snippet = self._extract_pytest_failure_snippet(pytest_output, max_chars=320)
             findings.append(
                 ReviewFindingItem(
                     severity="high",
                     file=target_file,
                     line=1,
                     comment=f"격리 환경에서 실행한 `pytest`가 실패했습니다 (exit_code={pytest_exit_code}).",
-                    suggestion=f"실패 로그를 확인하고 테스트가 100% 통과하도록 수정하세요: {pytest_output[-220:].strip()}",
+                    suggestion=f"실패 로그를 확인하고 테스트가 100% 통과하도록 수정하세요: {snippet}",
                 )
             )
 
