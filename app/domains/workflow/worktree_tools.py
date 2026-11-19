@@ -12,11 +12,32 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+from app.domains.guardrails.isolation_policy import WorktreeIsolationPolicy
+
 _SENSITIVE_ENV_KEY_RE = re.compile(
-    r"(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL"
-    r"|^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$)",
+    r"(?:AUTHORIZATION|API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|"
+    r"CREDENTIAL|ACCESS_KEY|SIGNING_KEY|(?:^|_)KEY$|"
+    r"^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$)",
     re.IGNORECASE,
 )
+
+
+def build_safe_subprocess_env(
+    pythonpath: str | Path | None = None,
+    *,
+    prepend_venv_bin: bool = False,
+) -> dict[str, str]:
+    """Build a subprocess environment with Pod secrets and Git auth config scrubbed."""
+    env = {k: v for k, v in os.environ.items() if not _SENSITIVE_ENV_KEY_RE.search(k)}
+    if pythonpath is not None:
+        env["PYTHONPATH"] = str(pythonpath)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    if prepend_venv_bin:
+        venv_bin = str(Path(sys.executable).parent)
+        env["PATH"] = f"{venv_bin}:{env.get('PATH', '')}"
+    return env
 
 
 def build_agent_tools(
@@ -26,6 +47,7 @@ def build_agent_tools(
     read_mailbox_fn: Callable[[str], str] | None = None,
     update_task_fn: Callable[[str, str, str], str] | None = None,
     read_only: bool = False,
+    main_checkout_root: str | Path | None = None,
 ) -> tuple[dict[str, Callable[..., str]], list[dict[str, Any]]]:
     """
     지정된 `worktree_root` 내부에서 동작하는 코딩 도구 8종(또는 Reviewer용 읽기 전용 도구)과
@@ -33,6 +55,12 @@ def build_agent_tools(
     """
     wt_root = Path(worktree_root).resolve()
     git_path = wt_root / ".git"
+    policy = WorktreeIsolationPolicy(
+        worktree_root=wt_root,
+        main_checkout_root=(
+            Path(main_checkout_root).resolve() if main_checkout_root is not None else wt_root.parent
+        ),
+    )
 
     def _resolve_confined(rel_or_abs: str, *, allow_root: bool = False) -> Path:
         if "\x00" in rel_or_abs:
@@ -95,13 +123,12 @@ def build_agent_tools(
 
     def run_command(command: str, cwd: str | None = None) -> str:
         exec_cwd = _resolve_confined(cwd, allow_root=True) if cwd else wt_root
-        env = {k: v for k, v in os.environ.items() if not _SENSITIVE_ENV_KEY_RE.search(k)}
-        env["PYTHONPATH"] = str(exec_cwd)
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        env["GCM_INTERACTIVE"] = "never"
-        venv_bin = str(Path(sys.executable).parent)
-        env["PATH"] = f"{venv_bin}:{env.get('PATH', '')}"
+        verdict = policy.validate_shell_command(command, cwd=exec_cwd)
+        if not verdict.allowed:
+            raise PermissionError(
+                f"Blocked shell command ({verdict.check_name}): {verdict.reason}"
+            )
+        env = build_safe_subprocess_env(pythonpath=exec_cwd, prepend_venv_bin=True)
         proc = subprocess.run(
             command,
             shell=True,

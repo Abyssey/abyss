@@ -379,3 +379,20 @@ async def test_onboarding_answer_reanalyzes_when_repo_changes(tmp_path: Path) ->
     )
     assert res_exact["is_correct"] is True
     assert "worker.py" in res_exact["source_evidence"] or "other_service_app" in svc._cached_packages[other_key]["repo_name"]
+
+
+def test_link_local_metadata_ips_never_receive_internal_gitlab_auth(tmp_path: Path) -> None:
+    settings = _make_settings(
+        tmp_path,
+        internal_gitlab_url="",
+        internal_gitlab_token="fake-token-metadata-guard-token",
+    )
+    resolver = InternalGitSourceResolver(settings)
+    for metadata_url in (
+        "http://169.254.169.254/computeMetadata/v1/",
+        "http://[fe80::1]/repo.git",
+        "http://[::ffff:169.254.169.254]/repo.git",
+    ):
+        env = resolver.build_git_env(metadata_url)
+        assert "GIT_CONFIG_COUNT" not in env, f"Link-local URL {metadata_url} must not get auto-auth"
+

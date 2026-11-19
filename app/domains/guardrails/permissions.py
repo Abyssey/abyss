@@ -35,8 +35,14 @@ Decision = Literal["allow", "ask", "deny"]
 
 _ENV_ASSIGN = re.compile(r'^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"(?:\\.|[^"])*"|\'[^\']*\'|\S*)\s+)+')
 _ENV_VAR_TOKEN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_REDIR_OP_ONLY_RE = re.compile(r"^(?:[0-9]*)(?:<<-?|<<<|<>|<&|>&|>>|>\||<|>)$|^&>>?$")
+_REDIR_ATTACHED_RE = re.compile(r"^(?:[0-9]*)(?:<<-?|<<<|<>|<&|>&|>>|>\||<|>).+$|^&>>?.+$")
+_SHELL_PREFIX_KEYWORDS = frozenset({"!", "if", "then", "elif", "else", "do", "while", "until"})
 _RULE_SYNTAX = re.compile(r"^(?P<tool>[A-Za-z]+)(?:\((?P<pattern>.*)\))?$")
-_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "nohup"})
+_WRAPPERS = frozenset(
+    {"env", "command", "builtin", "exec", "nohup", "time", "nice", "timeout", "stdbuf"}
+)
+_SHELL_INTERPRETERS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "ash", "mksh"})
 _GIT_GLOBAL_VAL_FLAGS = frozenset(
     {
         "-C",
@@ -149,6 +155,12 @@ def _strip_git_global_flags(tokens: list[str]) -> list[str]:
         if tok == "--":
             i += 1
             break
+        if _REDIR_OP_ONLY_RE.match(tok):
+            i += 2
+            continue
+        if _REDIR_ATTACHED_RE.match(tok):
+            i += 1
+            continue
         if tok in _GIT_GLOBAL_VAL_FLAGS:
             i += 2
             continue
@@ -216,9 +228,48 @@ def _canonicalize_rm(tokens: list[str]) -> list[str]:
 
 
 def _peel_env_and_wrappers(tokens: list[str]) -> list[str]:
-    """Peel leading `VAR=val` assignments and standard shell wrappers (`env`/`command`/`builtin`/`exec`/`nohup`)."""
+    """
+    Peel leading POSIX redirections, negation `!`, control keywords (`if`/`then`/`do`/`else`/etc.),
+    `VAR=val` assignments, and shell wrappers (`env`/`command`/`builtin`/`exec`/`nohup`/`time`/`nice`/`timeout`/`stdbuf`).
+    """
     cur = list(tokens)
+    split_depth = 0
     while cur:
+        # 1. Leading POSIX redirections (`</dev/null`, `2>/dev/null`, `< /dev/null`, `>&2`, `1>out`)
+        if _REDIR_OP_ONLY_RE.match(cur[0]):
+            cur = cur[2:] if len(cur) >= 2 else []
+            continue
+        if _REDIR_ATTACHED_RE.match(cur[0]):
+            cur.pop(0)
+            continue
+
+        # 2. Leading `case <word> in <pattern>) <cmd>`
+        if cur[0] == "case" and "in" in cur[1:]:
+            in_idx = cur.index("in", 1)
+            pat_idx = next(
+                (k for k in range(in_idx + 1, len(cur)) if cur[k].endswith(")")),
+                None,
+            )
+            if pat_idx is not None and pat_idx + 1 < len(cur):
+                cur = cur[pat_idx + 1 :]
+                continue
+
+        # 3. Leading negation `!` and POSIX control-flow keywords
+        if cur[0] in _SHELL_PREFIX_KEYWORDS and len(cur) > 1:
+            cur.pop(0)
+            continue
+
+        # 4. Subsequent `case` arm pattern like `*) git push`
+        if (
+            cur[0].endswith(")")
+            and "/" not in cur[0]
+            and not cur[0].startswith("-")
+            and len(cur) > 1
+        ):
+            cur.pop(0)
+            continue
+
+        # 5. Leading environment variable assignments (`FOO=1`)
         if _ENV_VAR_TOKEN.match(cur[0]):
             cur.pop(0)
             continue
@@ -235,13 +286,18 @@ def _peel_env_and_wrappers(tokens: list[str]) -> list[str]:
                 if tok == "--":
                     idx += 1
                     break
+                if tok == "-":
+                    idx += 1
+                    continue
                 if tok in ("-S", "--split-string") and idx + 1 < len(cur):
                     arg = cur[idx + 1]
                     try:
                         expanded = shlex.split(arg, posix=True)
                     except ValueError:
                         expanded = arg.split()
-                    cur = expanded + cur[idx + 2 :]
+                    split_depth += 1
+                    tail = cur[idx + 2 :]
+                    cur = ["env", *expanded, *tail] if split_depth <= 8 else [*expanded, *tail]
                     split_replaced = True
                     break
                 if tok.startswith("--split-string="):
@@ -250,23 +306,54 @@ def _peel_env_and_wrappers(tokens: list[str]) -> list[str]:
                         expanded = shlex.split(arg, posix=True)
                     except ValueError:
                         expanded = arg.split()
-                    cur = expanded + cur[idx + 1 :]
+                    split_depth += 1
+                    tail = cur[idx + 1 :]
+                    cur = ["env", *expanded, *tail] if split_depth <= 8 else [*expanded, *tail]
                     split_replaced = True
                     break
-                if tok.startswith("-S") and len(tok) > 2:
-                    arg = tok[2:]
-                    try:
-                        expanded = shlex.split(arg, posix=True)
-                    except ValueError:
-                        expanded = arg.split()
-                    cur = expanded + cur[idx + 1 :]
-                    split_replaced = True
-                    break
-                if tok in ("-u", "-C", "--unset", "--chdir"):
+                if tok in ("--unset", "--chdir", "--argv0"):
                     idx += 2
                     continue
-                if tok.startswith("-") or _ENV_VAR_TOKEN.match(tok):
+                if tok.startswith("--") or _ENV_VAR_TOKEN.match(tok):
                     idx += 1
+                    continue
+                if tok.startswith("-") and len(tok) > 1:
+                    consumed_next = False
+                    for j in range(1, len(tok)):
+                        ch = tok[j]
+                        if ch == "S":
+                            if j + 1 < len(tok):
+                                arg = tok[j + 1 :]
+                                tail = cur[idx + 1 :]
+                            elif idx + 1 < len(cur):
+                                arg = cur[idx + 1]
+                                tail = cur[idx + 2 :]
+                            else:
+                                arg = ""
+                                tail = []
+                            try:
+                                expanded = shlex.split(arg, posix=True)
+                            except ValueError:
+                                expanded = arg.split()
+                            split_depth += 1
+                            cur = (
+                                ["env", *expanded, *tail]
+                                if split_depth <= 8
+                                else [*expanded, *tail]
+                            )
+                            split_replaced = True
+                            break
+                        if ch in ("C", "u", "a"):
+                            if j + 1 < len(tok):
+                                idx += 1
+                            else:
+                                idx += 2
+                            consumed_next = True
+                            break
+                    if split_replaced:
+                        break
+                    if not consumed_next:
+                        idx += 1
                     continue
                 break
             if split_replaced:
@@ -304,6 +391,73 @@ def _peel_env_and_wrappers(tokens: list[str]) -> list[str]:
                 continue
             break
 
+        if head == "time":
+            idx = 1
+            while idx < len(cur) and cur[idx].startswith("-"):
+                tok = cur[idx]
+                if tok == "--":
+                    idx += 1
+                    break
+                if tok in ("-f", "-o", "--format", "--output") and idx + 1 < len(cur):
+                    idx += 2
+                else:
+                    idx += 1
+            if idx < len(cur):
+                cur = cur[idx:]
+                continue
+            break
+
+        if head == "nice":
+            idx = 1
+            while idx < len(cur) and cur[idx].startswith("-"):
+                tok = cur[idx]
+                if tok == "--":
+                    idx += 1
+                    break
+                if tok in ("-n", "--adjustment") and idx + 1 < len(cur):
+                    idx += 2
+                else:
+                    idx += 1
+            if idx < len(cur):
+                cur = cur[idx:]
+                continue
+            break
+
+        if head == "timeout":
+            idx = 1
+            while idx < len(cur) and cur[idx].startswith("-"):
+                tok = cur[idx]
+                if tok == "--":
+                    idx += 1
+                    break
+                if tok in ("-k", "--kill-after", "-s", "--signal") and idx + 1 < len(cur):
+                    idx += 2
+                else:
+                    idx += 1
+            # Skip mandatory duration argument (e.g. `5`, `10s`, `1m`)
+            if idx < len(cur):
+                idx += 1
+            if idx < len(cur):
+                cur = cur[idx:]
+                continue
+            break
+
+        if head == "stdbuf":
+            idx = 1
+            while idx < len(cur) and cur[idx].startswith("-"):
+                tok = cur[idx]
+                if tok == "--":
+                    idx += 1
+                    break
+                if tok in ("-i", "-o", "-e", "--input", "--output", "--error") and idx + 1 < len(cur):
+                    idx += 2
+                else:
+                    idx += 1
+            if idx < len(cur):
+                cur = cur[idx:]
+                continue
+            break
+
         # builtin / nohup
         idx = 1
         if idx < len(cur) and cur[idx] == "--":
@@ -316,17 +470,38 @@ def _peel_env_and_wrappers(tokens: list[str]) -> list[str]:
     return cur
 
 
-def normalize_segment(segment: str) -> str:
-    r"""
-    규칙 매칭용 셸 세그먼트 정규화:
-      - 외부 그룹 `( ... )` / `{ ...; }` 제거
-      - 따옴표 포함 환경변수 대입(`FOO=1 BAR="a && b"`) 및 래퍼(`env`/`command`/`builtin`/`exec`/`nohup`) 제거
-      - 절대 실행 경로(`/usr/bin/git`), 백슬래시(`\git`), 따옴표(`'git'`), 다중 공백 정규화
-      - `git` 전역 옵션 및 `rm` 재귀·강제 플래그(`rm -fr /`, `rm -r -f /`) 의미 정규화
-    """
+def _extract_nested_shell_script(tokens: list[str]) -> str | None:
+    """Extract the script argument from `sh -c '...'` / `bash -lc '...'` / `dash|zsh|ksh -c '...'`."""
+    if not tokens or tokens[0] not in _SHELL_INTERPRETERS:
+        return None
+    idx = 1
+    saw_c = False
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok == "--":
+            idx += 1
+            break
+        if tok in ("-o", "+o"):
+            idx += 2
+            continue
+        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
+            if "c" in tok[1:]:
+                saw_c = True
+            idx += 1
+            continue
+        if tok.startswith("--"):
+            idx += 1
+            continue
+        break
+    if saw_c and idx < len(tokens):
+        return tokens[idx]
+    return None
+
+
+def _tokenize_and_normalize_segment(segment: str) -> tuple[str, list[str]]:
     cleaned = _strip_outer_grouping(segment)
     if not cleaned:
-        return ""
+        return "", []
 
     try:
         tokens = shlex.split(cleaned, posix=True)
@@ -337,14 +512,41 @@ def normalize_segment(segment: str) -> str:
 
     tokens = _peel_env_and_wrappers(tokens)
     if not tokens:
-        return ""
+        return "", []
 
     if "/" in tokens[0]:
         tokens[0] = posixpath.basename(tokens[0])
 
+    peeled = list(tokens)
     tokens = _strip_git_global_flags(tokens)
     tokens = _canonicalize_rm(tokens)
-    return " ".join(tokens)
+    return " ".join(tokens), peeled
+
+
+def normalize_segment(segment: str) -> str:
+    r"""
+    규칙 매칭용 셸 세그먼트 정규화:
+      - 외부 그룹 `( ... )` / `{ ...; }` 제거
+      - 선행 리다이렉션(`</dev/null`, `2>/dev/null`), `!`, 제어 키워드(`if`/`then`/`do` 등) 제거
+      - 따옴표 포함 환경변수 대입(`FOO=1 BAR="a && b"`) 및 래퍼(`env`/`command`/`builtin`/`exec`/`nohup`/`time`/`nice`/`timeout`) 제거
+      - 절대 실행 경로(`/usr/bin/git`), 백슬래시(`\git`), 따옴표(`'git'`), 다중 공백 정규화
+      - `git` 전역 옵션 및 `rm` 재귀·강제 플래그(`rm -fr /`, `rm -r -f /`) 의미 정규화
+    """
+    norm, _ = _tokenize_and_normalize_segment(segment)
+    return norm
+
+
+def _expand_bash_subjects(command: str, *, _depth: int = 0) -> list[str]:
+    subjects: list[str] = []
+    for seg in split_compound_command(command):
+        norm, peeled = _tokenize_and_normalize_segment(seg)
+        if norm:
+            subjects.append(norm)
+        if _depth < 4:
+            nested = _extract_nested_shell_script(peeled)
+            if nested:
+                subjects.extend(_expand_bash_subjects(nested, _depth=_depth + 1))
+    return subjects
 
 
 def _normalize_file_subject(path: str) -> str:
@@ -421,15 +623,11 @@ class PermissionRules:
 
     def evaluate(self, tool: str, subject: str) -> PermissionDecision:
         """
-        tool="Bash"이면 subject(명령)를 세그먼트로 쪼개 **각 부분**을 검사합니다.
+        tool="Bash"이면 subject(명령)를 세그먼트로 쪼개 **각 부분** (및 중첩 `sh -c` 스크립트)을 검사합니다.
         파일 도구(Read/Edit/Write/Glob)는 경로를 정규화(`sub/../.env` -> `.env`)해 매칭합니다.
         """
         if tool == "Bash":
-            subjects = [
-                norm
-                for seg in split_compound_command(subject)
-                if (norm := normalize_segment(seg))
-            ]
+            subjects = _expand_bash_subjects(subject)
         else:
             subjects = [_normalize_file_subject(subject)]
 

@@ -38,7 +38,16 @@ from pathlib import Path
 from app.domains.guardrails.permissions import split_compound_command
 
 _ENV_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_WRAPPER_CMDS = frozenset({"env", "command", "builtin", "exec", "nohup"})
+_FORBIDDEN_ENV_OVERRIDES_RE = re.compile(
+    r"^(?:GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_COMMON_DIR|CDPATH)="
+)
+_REDIR_OP_ONLY_RE = re.compile(r"^(?:[0-9]*)(?:<<-?|<<<|<>|<&|>&|>>|>\||<|>)$|^&>>?$")
+_REDIR_ATTACHED_RE = re.compile(r"^(?:[0-9]*)(?:<<-?|<<<|<>|<&|>&|>>|>\||<|>).+$|^&>>?.+$")
+_SHELL_PREFIX_KEYWORDS = frozenset({"!", "if", "then", "elif", "else", "do", "while", "until"})
+_WRAPPER_CMDS = frozenset(
+    {"env", "command", "builtin", "exec", "nohup", "time", "nice", "timeout", "stdbuf"}
+)
+_SHELL_INTERPRETERS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "ash", "mksh"})
 _GIT_OTHER_VAL_FLAGS = frozenset(
     {"--namespace", "--config-env", "--exec-path", "--super-prefix", "--list-cmds"}
 )
@@ -317,36 +326,108 @@ class WorktreeIsolationPolicy:
             ),
         )
 
-    def _inspect_segment_redirects(self, segment: str) -> PolicyVerdict | None:
-        cleaned = _strip_segment_grouping(segment)
-        if not cleaned:
-            return None
+    def _reject_shape(self, reason: str, hint: str | None = None) -> PolicyVerdict:
+        return PolicyVerdict(
+            allowed=False,
+            check_name="command_shape",
+            reason=reason,
+            remediation_hint=hint
+            or (
+                "Worktree 격리 규칙에 따라 동적 명령 치환, eval, 중첩 셸(-c) 대신 "
+                "명확한 평문 명령어(plain, separate commands)로 나누어 다시 호출하세요."
+            ),
+        )
 
-        try:
-            tokens = shlex.split(cleaned, posix=True)
-        except ValueError:
-            # Conservative fallback on unbalanced quotes
-            for match in re.finditer(r"\bgit\b[^;&|\n]*?(?:\s|^)-C(?:\s*([^\s;&|\n]+))", cleaned):
-                arg = match.group(1).strip("'\"")
-                if not self._is_path_inside_worktree(arg):
-                    return self._reject_redirect(
-                        f"Blocked git -C redirect outside worktree: '{arg}'."
-                    )
-            if re.search(r"\b(?:cd|pushd)\b", cleaned):
-                return self._reject_redirect(
-                    "Blocked cd/pushd in command with unbalanced quotes."
-                )
-            return None
+    @staticmethod
+    def _extract_nested_shell_script(tokens: list[str]) -> tuple[bool, str | None]:
+        """Return `(has_c_flag, script_or_none)` if `tokens[0]` is a POSIX shell with `-c`."""
+        if not tokens:
+            return False, None
+        cmd = posixpath.basename(tokens[0]) if "/" in tokens[0] else tokens[0]
+        if cmd not in _SHELL_INTERPRETERS:
+            return False, None
+        idx = 1
+        saw_c = False
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if tok == "--":
+                idx += 1
+                break
+            if tok in ("-o", "+o"):
+                idx += 2
+                continue
+            if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
+                if "c" in tok[1:]:
+                    saw_c = True
+                idx += 1
+                continue
+            if tok.startswith("--"):
+                idx += 1
+                continue
+            break
+        if saw_c:
+            return True, (tokens[idx] if idx < len(tokens) else None)
+        return False, None
 
-        # Peel leading env assignments and wrappers while inspecting `env -C <dir>`
+    def _peel_segment_tokens(
+        self, tokens: list[str], *, check_redirects: bool
+    ) -> tuple[list[str], PolicyVerdict | None]:
+        """
+        Peel leading POSIX redirections, `!`, control keywords (`if`/`then`/`do`/`else`/etc.),
+        `VAR=val` assignments, and wrappers (`env`/`command`/`builtin`/`exec`/`nohup`/`time`/`nice`/`timeout`/`stdbuf`).
+        When `check_redirects=True`, rejects forbidden `GIT_*`/`CDPATH` overrides and escaping `env -C` targets.
+        """
         cur = list(tokens)
+        split_depth = 0
         while cur:
-            if _ENV_VAR_RE.match(cur[0]):
+            # 1. Leading POSIX redirections (`</dev/null`, `2>/dev/null`, `< /dev/null`, `>&2`, `1>out`)
+            if _REDIR_OP_ONLY_RE.match(cur[0]):
+                cur = cur[2:] if len(cur) >= 2 else []
+                continue
+            if _REDIR_ATTACHED_RE.match(cur[0]):
                 cur.pop(0)
                 continue
+
+            # 2. Leading `case <word> in <pattern>) <cmd>`
+            if cur[0] == "case" and "in" in cur[1:]:
+                in_idx = cur.index("in", 1)
+                pat_idx = next(
+                    (k for k in range(in_idx + 1, len(cur)) if cur[k].endswith(")")),
+                    None,
+                )
+                if pat_idx is not None and pat_idx + 1 < len(cur):
+                    cur = cur[pat_idx + 1 :]
+                    continue
+
+            # 3. Leading negation `!` and POSIX control-flow keywords
+            if cur[0] in _SHELL_PREFIX_KEYWORDS and len(cur) > 1:
+                cur.pop(0)
+                continue
+
+            # 4. Subsequent `case` arm pattern like `*) git ...`
+            if (
+                cur[0].endswith(")")
+                and "/" not in cur[0]
+                and not cur[0].startswith("-")
+                and len(cur) > 1
+            ):
+                cur.pop(0)
+                continue
+
+            # 5. Leading environment variable assignments (`VAR=val`)
+            if _ENV_VAR_RE.match(cur[0]):
+                if check_redirects and _FORBIDDEN_ENV_OVERRIDES_RE.match(cur[0]):
+                    var_name = cur[0].split("=", 1)[0]
+                    return [], self._reject_redirect(
+                        f"Blocked forbidden environment override '{var_name}=' outside worktree policy."
+                    )
+                cur.pop(0)
+                continue
+
             head = posixpath.basename(cur[0]) if "/" in cur[0] else cur[0]
             if head not in _WRAPPER_CMDS:
                 break
+
             if head == "env":
                 idx = 1
                 split_replaced = False
@@ -355,45 +436,121 @@ class WorktreeIsolationPolicy:
                     if tok == "--":
                         idx += 1
                         break
-                    if tok in ("-C", "--chdir"):
-                        if idx + 1 >= len(cur) or not self._is_path_inside_worktree(cur[idx + 1]):
-                            target = cur[idx + 1] if idx + 1 < len(cur) else "<missing>"
-                            return self._reject_redirect(
-                                f"Blocked 'env {tok} {target}' escaping worktree '{self.worktree_root}'."
+                    if tok == "-":
+                        idx += 1
+                        continue
+                    if tok == "--chdir":
+                        target = cur[idx + 1] if idx + 1 < len(cur) else ""
+                        if check_redirects and (not target or not self._is_path_inside_worktree(target)):
+                            return [], self._reject_redirect(
+                                f"Blocked 'env --chdir {target or '<missing>'}' escaping worktree '{self.worktree_root}'."
                             )
                         idx += 2
                         continue
                     if tok.startswith("--chdir="):
                         target = tok.split("=", 1)[1]
-                        if not self._is_path_inside_worktree(target):
-                            return self._reject_redirect(
+                        if check_redirects and not self._is_path_inside_worktree(target):
+                            return [], self._reject_redirect(
                                 f"Blocked 'env {tok}' escaping worktree '{self.worktree_root}'."
                             )
                         idx += 1
                         continue
-                    if tok.startswith("-C") and len(tok) > 2:
-                        target = tok[2:]
-                        if not self._is_path_inside_worktree(target):
-                            return self._reject_redirect(
-                                f"Blocked 'env {tok}' escaping worktree '{self.worktree_root}'."
-                            )
-                        idx += 1
-                        continue
-                    if tok in ("-S", "--split-string") and idx + 1 < len(cur):
+                    if tok == "--split-string":
+                        if idx + 1 >= len(cur):
+                            reject = self._reject_redirect if check_redirects else self._reject_shape
+                            return [], reject("Blocked env --split-string with missing argument.")
                         try:
                             expanded = shlex.split(cur[idx + 1], posix=True)
                         except ValueError:
-                            return self._reject_redirect(
-                                "Blocked env -S with unparseable split-string."
-                            )
-                        cur = expanded + cur[idx + 2 :]
+                            reject = self._reject_redirect if check_redirects else self._reject_shape
+                            return [], reject("Blocked env --split-string with unparseable split-string.")
+                        split_depth += 1
+                        if split_depth > 8:
+                            reject = self._reject_redirect if check_redirects else self._reject_shape
+                            return [], reject("Blocked deeply nested env --split-string expansion.")
+                        cur = ["env", *expanded, *cur[idx + 2 :]]
                         split_replaced = True
                         break
-                    if tok in ("-u", "--unset"):
+                    if tok.startswith("--split-string="):
+                        arg = tok.split("=", 1)[1]
+                        try:
+                            expanded = shlex.split(arg, posix=True)
+                        except ValueError:
+                            reject = self._reject_redirect if check_redirects else self._reject_shape
+                            return [], reject("Blocked env --split-string= with unparseable split-string.")
+                        split_depth += 1
+                        if split_depth > 8:
+                            reject = self._reject_redirect if check_redirects else self._reject_shape
+                            return [], reject("Blocked deeply nested env --split-string= expansion.")
+                        cur = ["env", *expanded, *cur[idx + 1 :]]
+                        split_replaced = True
+                        break
+                    if tok in ("--unset", "--argv0"):
                         idx += 2
                         continue
-                    if tok.startswith("-") or _ENV_VAR_RE.match(tok):
+                    if tok.startswith("--"):
                         idx += 1
+                        continue
+                    if _ENV_VAR_RE.match(tok):
+                        if check_redirects and _FORBIDDEN_ENV_OVERRIDES_RE.match(tok):
+                            var_name = tok.split("=", 1)[0]
+                            return [], self._reject_redirect(
+                                f"Blocked forbidden environment override 'env {var_name}=' outside worktree policy."
+                            )
+                        idx += 1
+                        continue
+                    if tok.startswith("-") and len(tok) > 1:
+                        consumed_next = False
+                        for j in range(1, len(tok)):
+                            ch = tok[j]
+                            if ch == "C":
+                                if j + 1 < len(tok):
+                                    target = tok[j + 1 :]
+                                    idx += 1
+                                else:
+                                    target = cur[idx + 1] if idx + 1 < len(cur) else ""
+                                    idx += 2
+                                if check_redirects and (
+                                    not target or not self._is_path_inside_worktree(target)
+                                ):
+                                    return [], self._reject_redirect(
+                                        f"Blocked 'env {tok} {target or '<missing>'}' escaping worktree '{self.worktree_root}'."
+                                    )
+                                consumed_next = True
+                                break
+                            if ch == "S":
+                                if j + 1 < len(tok):
+                                    arg = tok[j + 1 :]
+                                    tail = cur[idx + 1 :]
+                                elif idx + 1 < len(cur):
+                                    arg = cur[idx + 1]
+                                    tail = cur[idx + 2 :]
+                                else:
+                                    reject = self._reject_redirect if check_redirects else self._reject_shape
+                                    return [], reject("Blocked env -S with missing split-string.")
+                                try:
+                                    expanded = shlex.split(arg, posix=True)
+                                except ValueError:
+                                    reject = self._reject_redirect if check_redirects else self._reject_shape
+                                    return [], reject("Blocked env -S with unparseable split-string.")
+                                split_depth += 1
+                                if split_depth > 8:
+                                    reject = self._reject_redirect if check_redirects else self._reject_shape
+                                    return [], reject("Blocked deeply nested env -S expansion.")
+                                cur = ["env", *expanded, *tail]
+                                split_replaced = True
+                                break
+                            if ch in ("u", "a"):
+                                if j + 1 < len(tok):
+                                    idx += 1
+                                else:
+                                    idx += 2
+                                consumed_next = True
+                                break
+                        if split_replaced:
+                            break
+                        if not consumed_next:
+                            idx += 1
                         continue
                     break
                 if split_replaced:
@@ -425,16 +582,198 @@ class WorktreeIsolationPolicy:
                 cur = cur[idx:]
                 continue
 
+            if head == "time":
+                idx = 1
+                while idx < len(cur) and cur[idx].startswith("-"):
+                    tok = cur[idx]
+                    if tok == "--":
+                        idx += 1
+                        break
+                    if tok in ("-f", "-o", "--format", "--output") and idx + 1 < len(cur):
+                        idx += 2
+                    else:
+                        idx += 1
+                cur = cur[idx:]
+                continue
+
+            if head == "nice":
+                idx = 1
+                while idx < len(cur) and cur[idx].startswith("-"):
+                    tok = cur[idx]
+                    if tok == "--":
+                        idx += 1
+                        break
+                    if tok in ("-n", "--adjustment") and idx + 1 < len(cur):
+                        idx += 2
+                    else:
+                        idx += 1
+                cur = cur[idx:]
+                continue
+
+            if head == "timeout":
+                idx = 1
+                while idx < len(cur) and cur[idx].startswith("-"):
+                    tok = cur[idx]
+                    if tok == "--":
+                        idx += 1
+                        break
+                    if tok in ("-k", "--kill-after", "-s", "--signal") and idx + 1 < len(cur):
+                        idx += 2
+                    else:
+                        idx += 1
+                if idx < len(cur):
+                    idx += 1
+                cur = cur[idx:]
+                continue
+
+            if head == "stdbuf":
+                idx = 1
+                while idx < len(cur) and cur[idx].startswith("-"):
+                    tok = cur[idx]
+                    if tok == "--":
+                        idx += 1
+                        break
+                    if tok in ("-i", "-o", "-e", "--input", "--output", "--error") and idx + 1 < len(cur):
+                        idx += 2
+                    else:
+                        idx += 1
+                cur = cur[idx:]
+                continue
+
             # builtin / nohup
             idx = 1
             if idx < len(cur) and cur[idx] == "--":
                 idx += 1
             cur = cur[idx:]
 
+        return cur, None
+
+    def _inspect_segment_shape(self, segment: str) -> PolicyVerdict | None:
+        cleaned = _strip_segment_grouping(segment)
+        if not cleaned:
+            return None
+
+        try:
+            tokens = shlex.split(cleaned, posix=True)
+        except ValueError:
+            # Conservative fallback on unbalanced quotes: unescape quotes/backslashes per token
+            rough = [
+                re.sub(r"\\(.)", r"\1", tok).replace("'", "").replace('"', "")
+                for tok in cleaned.split()
+            ]
+            rough = [t for t in rough if t]
+            cur, verdict = self._peel_segment_tokens(rough, check_redirects=False)
+            if verdict is not None:
+                return verdict
+            if not cur:
+                return None
+            cmd = posixpath.basename(cur[0]) if "/" in cur[0] else cur[0]
+            if cmd == "eval":
+                return self._reject_shape(
+                    "Unverifiable command shape blocked: eval 명령은 Worktree 격리 하에서 금지됩니다."
+                )
+            has_c, _ = self._extract_nested_shell_script(cur)
+            if has_c:
+                return self._reject_shape(
+                    f"Unverifiable command shape blocked: 중첩 셸 실행('{cmd} -c')은 금지됩니다."
+                )
+            return None
+
+        cur, verdict = self._peel_segment_tokens(tokens, check_redirects=False)
+        if verdict is not None:
+            return verdict
         if not cur:
             return None
 
         cmd = posixpath.basename(cur[0]) if "/" in cur[0] else cur[0]
+
+        if cmd == "eval":
+            return self._reject_shape(
+                "Unverifiable command shape blocked: eval 명령은 런타임에 임의의 셸 구문을 실행하므로 Worktree 격리 하에서 금지됩니다."
+            )
+
+        if cmd in (".", "source"):
+            idx = 1
+            while idx < len(cur):
+                if cur[idx] == "--":
+                    idx += 1
+                    break
+                if _REDIR_OP_ONLY_RE.match(cur[idx]):
+                    idx += 2
+                    continue
+                if _REDIR_ATTACHED_RE.match(cur[idx]):
+                    idx += 1
+                    continue
+                break
+            target = cur[idx] if idx < len(cur) else ""
+            if not target or not self._is_path_inside_worktree(target):
+                return self._reject_shape(
+                    f"Unverifiable command shape blocked: Worktree 외부 스크립트 '{cmd} {target or '<missing>'}' 실행은 금지됩니다."
+                )
+
+        has_c, _ = self._extract_nested_shell_script(cur)
+        if has_c:
+            return self._reject_shape(
+                f"Unverifiable command shape blocked: 중첩 셸 실행('{cmd} -c ...')은 정적 검증을 우회할 수 있어 금지됩니다."
+            )
+
+        return None
+
+    def _inspect_segment_redirects(
+        self, segment: str, *, _depth: int = 0
+    ) -> PolicyVerdict | None:
+        cleaned = _strip_segment_grouping(segment)
+        if not cleaned:
+            return None
+
+        try:
+            tokens = shlex.split(cleaned, posix=True)
+        except ValueError:
+            # Conservative fallback on unbalanced quotes
+            for match in re.finditer(r"\bgit\b[^;&|\n]*?(?:\s|^)-C(?:\s*([^\s;&|\n]+))", cleaned):
+                arg = match.group(1).strip("'\"")
+                if not self._is_path_inside_worktree(arg):
+                    return self._reject_redirect(
+                        f"Blocked git -C redirect outside worktree: '{arg}'."
+                    )
+            if re.search(r"\b(?:cd|pushd)\b", cleaned):
+                return self._reject_redirect(
+                    "Blocked cd/pushd in command with unbalanced quotes."
+                )
+            for tok in cleaned.split():
+                unesc = re.sub(r"\\(.)", r"\1", tok).replace("'", "").replace('"', "")
+                if _FORBIDDEN_ENV_OVERRIDES_RE.match(unesc):
+                    return self._reject_redirect(
+                        f"Blocked forbidden environment override in command with unbalanced quotes: {unesc.split('=', 1)[0]}="
+                    )
+            return None
+
+        cur, verdict = self._peel_segment_tokens(tokens, check_redirects=True)
+        if verdict is not None:
+            return verdict
+        if not cur:
+            return None
+
+        cmd = posixpath.basename(cur[0]) if "/" in cur[0] else cur[0]
+
+        if cmd in ("export", "declare", "typeset", "local", "readonly"):
+            for tok in cur[1:]:
+                if tok.startswith("-"):
+                    continue
+                if _FORBIDDEN_ENV_OVERRIDES_RE.match(tok):
+                    var_name = tok.split("=", 1)[0]
+                    return self._reject_redirect(
+                        f"Blocked '{cmd} {var_name}=' environment override outside worktree policy."
+                    )
+            return None
+
+        has_c, nested_script = self._extract_nested_shell_script(cur)
+        if has_c and nested_script and _depth < 4:
+            for sub_seg in split_compound_command(nested_script):
+                sub_verdict = self._inspect_segment_redirects(sub_seg, _depth=_depth + 1)
+                if sub_verdict is not None:
+                    return sub_verdict
+            return None
 
         if cmd == "git":
             idx = 1
@@ -442,6 +781,12 @@ class WorktreeIsolationPolicy:
                 tok = cur[idx]
                 if tok == "--":
                     break
+                if _REDIR_OP_ONLY_RE.match(tok):
+                    idx += 2
+                    continue
+                if _REDIR_ATTACHED_RE.match(tok):
+                    idx += 1
+                    continue
                 if tok == "-C":
                     if idx + 1 >= len(cur) or not self._is_path_inside_worktree(cur[idx + 1]):
                         target = cur[idx + 1] if idx + 1 < len(cur) else "<missing>"
@@ -504,12 +849,22 @@ class WorktreeIsolationPolicy:
         if cmd in ("cd", "pushd"):
             targets: list[str] = []
             after_dd = False
-            for tok in cur[1:]:
+            idx = 1
+            while idx < len(cur):
+                tok = cur[idx]
+                if _REDIR_OP_ONLY_RE.match(tok):
+                    idx += 2
+                    continue
+                if _REDIR_ATTACHED_RE.match(tok):
+                    idx += 1
+                    continue
                 if after_dd:
                     targets.append(tok)
+                    idx += 1
                     continue
                 if tok == "--":
                     after_dd = True
+                    idx += 1
                     continue
                 if tok == "-":
                     return self._reject_redirect(
@@ -522,8 +877,10 @@ class WorktreeIsolationPolicy:
                         "Worktree 외부 디렉토리로 이동하지 마세요.",
                     )
                 if tok.startswith("-") and set(tok[1:]).issubset({"L", "P", "e", "@", "n"}):
+                    idx += 1
                     continue
                 targets.append(tok)
+                idx += 1
 
             if not targets:
                 return self._reject_redirect(
@@ -543,7 +900,7 @@ class WorktreeIsolationPolicy:
         """
         [Check #3: Git Redirects]
         셸 명령이 `git -C`, `--git-dir`, `--work-tree`, `git -c core.worktree=`,
-        `GIT_DIR=`, `env -C`, 또는 Worktree 외부로의 `cd`/`pushd`를 통해
+        `GIT_DIR=`/`CDPATH=`, `env -C`, 또는 Worktree 외부로의 `cd`/`pushd`를 통해
         메인 체크아웃의 Git 상태를 변경하려는 시도를 차단합니다.
         """
         for pattern, description in self._GIT_REDIRECT_PATTERNS:
@@ -573,8 +930,8 @@ class WorktreeIsolationPolicy:
     def validate_command_shape(self, command: str) -> PolicyVerdict:
         """
         [Check #4: Command Shape]
-        명령어 텍스트만 보고 안전성을 검증할 수 없는 동적 셸 구문(${!name}, eval, 백틱, $(...), <(...)/ >(...))을
-        차단하고, 평문 명령어로 재작성하도록 안내합니다.
+        명령어 텍스트만 보고 안전성을 검증할 수 없는 동적 셸 구문(${!name}, eval, 중첩 셸 -c,
+        백틱, $(...), <(...)/ >(...))을 차단하고, 평문 명령어로 재작성하도록 안내합니다.
         """
         if not command or not command.strip() or not command.strip(" \t\r\n;|&"):
             return PolicyVerdict(
@@ -593,15 +950,12 @@ class WorktreeIsolationPolicy:
 
         for pattern, description in self._DYNAMIC_SHAPE_PATTERNS:
             if pattern.search(command):
-                return PolicyVerdict(
-                    allowed=False,
-                    check_name="command_shape",
-                    reason=f"Unverifiable command shape blocked: {description}",
-                    remediation_hint=(
-                        "Worktree 격리 규칙에 따라 동적 명령 치환이나 eval 대신 "
-                        "명확한 평문 명령어(plain, separate commands)로 나누어 다시 호출하세요."
-                    ),
-                )
+                return self._reject_shape(f"Unverifiable command shape blocked: {description}")
+
+        for seg in split_compound_command(command):
+            verdict = self._inspect_segment_shape(seg)
+            if verdict is not None:
+                return verdict
 
         return PolicyVerdict(
             allowed=True,

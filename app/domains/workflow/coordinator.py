@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 import sys
 import threading
@@ -19,6 +18,7 @@ from typing import Any, Callable
 from app.core.config import AppSettings
 from app.core.llm.provider_rotator import LLMProviderRotator
 from app.domains.execution.runtime import AgentRuntime, HandoffArtifact
+from app.domains.guardrails.permissions import PermissionRules
 from app.domains.workflow.deepagents_adapter import create_worktree_deep_agent
 from app.domains.workflow.evaluator import EvaluatorRubric, ReviewDecision
 from app.domains.workflow.seed_templates import (
@@ -30,7 +30,7 @@ from app.domains.workflow.seed_templates import (
     WORKER_3_VIEW_CODE,
 )
 from app.domains.workflow.worktree_adapter import GitWorktreeManager
-from app.domains.workflow.worktree_tools import build_agent_tools
+from app.domains.workflow.worktree_tools import build_agent_tools, build_safe_subprocess_env
 
 
 @dataclass
@@ -424,6 +424,7 @@ class MultiAgentTeamCoordinator:
             send_mailbox_fn=self.send_mailbox_message,
             read_mailbox_fn=self.read_mailbox_messages,
             update_task_fn=self.update_task_status,
+            main_checkout_root=self.workspace_root,
         )
 
         runtime = AgentRuntime(
@@ -437,6 +438,7 @@ class MultiAgentTeamCoordinator:
             max_steps=8,
             event_callback=self.emit_event,
             context_strategy="reset_handoff",
+            permissions=PermissionRules.default(),
         )
 
         scripted_responder = self._build_worker_scripted_responder(
@@ -658,9 +660,7 @@ class MultiAgentTeamCoordinator:
                 diff_text = self.worktree_mgr.get_worktree_diff(worker_id)
 
                 test_file = t.target_files[1]
-                env = os.environ.copy()
-                env["PYTHONPATH"] = str(wt_info.worktree_path)
-                env["PYTHONDONTWRITEBYTECODE"] = "1"
+                env = build_safe_subprocess_env(wt_info.worktree_path)
                 pytest_proc = subprocess.run(
                     [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", test_file, "-v"],
                     cwd=str(wt_info.worktree_path),
@@ -725,9 +725,7 @@ class MultiAgentTeamCoordinator:
                         }
                     )
 
-            main_env = os.environ.copy()
-            main_env["PYTHONPATH"] = str(self.workspace_root)
-            main_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            main_env = build_safe_subprocess_env(self.workspace_root)
             final_pytest = subprocess.run(
                 [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "tests", "-q"],
                 cwd=str(self.workspace_root),

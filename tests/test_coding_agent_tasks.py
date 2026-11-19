@@ -462,3 +462,44 @@ def test_build_commits_no_pyc_preserves_repo_name_and_survives_copystat_eperm(
         prev = client.get(b["preview_url"])
         assert prev.status_code == 200
         assert "<title>billing_portal_demo — Interactive Project Map</title>" in prev.text
+
+
+def test_r3_empty_instruction_inspection_nonzero_count_and_pytest_secret_scrub(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("INTERNAL_GITLAB_TOKEN", "CANARY_POD_GITLAB_77777")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "CANARY_POD_AWS_88888")
+
+    sample_dir = tmp_path / "orders_gateway"
+    sample_dir.mkdir()
+    (sample_dir / "service.py").write_text(
+        '"""Order gateway service."""\ndef ping() -> str:\n    return "ok"\n', encoding="utf-8"
+    )
+    (sample_dir / "models.py").write_text(
+        '"""Order models."""\nclass Order:\n    id: int = 1\n', encoding="utf-8"
+    )
+
+    test_app, _ = _make_isolated_test_app(tmp_path)
+    with TestClient(test_app) as client:
+        # Empty instruction must succeed cleanly on inspection_dashboard and count real files (> 0)
+        res = client.post(
+            "/api/workflow/tasks/build",
+            json={
+                "repo_url_or_path": str(sample_dir),
+                "instruction": "",
+                "preset": "inspection_dashboard",
+                "push_to_remote": False,
+            },
+        )
+        assert res.status_code == 200, res.text
+        b = res.json()
+        assert b["status"] == "completed"
+        assert b["test_result"]["passed"] is True
+        assert "CANARY_POD_GITLAB_77777" not in b["test_result"]["output"]
+        assert "CANARY_POD_AWS_88888" not in b["test_result"]["output"]
+
+        prev = client.get(b["preview_url"])
+        assert prev.status_code == 200
+        assert "orders_gateway" in prev.text
+        assert "Python 파일 0개" not in prev.text
+

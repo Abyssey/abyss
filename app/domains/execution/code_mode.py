@@ -36,6 +36,7 @@ import ast
 import asyncio
 import builtins
 import difflib
+import inspect
 import json
 import os
 import re
@@ -205,12 +206,98 @@ _FORBIDDEN_NAMES = frozenset(
         "memoryview", "type", "object", "super", "classmethod", "staticmethod", "format",
     }
 )
-_FORBIDDEN_ATTRS = frozenset({"format", "format_map"})
+_FORBIDDEN_ATTRS = frozenset(
+    {
+        "format",
+        "format_map",
+        # Coroutine, generator & async-generator inspection
+        "cr_frame",
+        "cr_code",
+        "cr_await",
+        "cr_origin",
+        "cr_running",
+        "gi_frame",
+        "gi_code",
+        "gi_yieldfrom",
+        "gi_running",
+        "ag_frame",
+        "ag_code",
+        "ag_await",
+        "ag_running",
+        # Frame inspection
+        "f_globals",
+        "f_locals",
+        "f_builtins",
+        "f_back",
+        "f_code",
+        "f_trace",
+        "f_trace_lines",
+        "f_trace_opcodes",
+        # Traceback inspection
+        "tb_frame",
+        "tb_next",
+        # Code, function, closure, method & type inspection
+        "co_consts",
+        "co_names",
+        "co_varnames",
+        "co_freevars",
+        "co_cellvars",
+        "co_code",
+        "cell_contents",
+        "func_globals",
+        "func_code",
+        "func_closure",
+        "func_defaults",
+        "im_func",
+        "im_self",
+        "im_class",
+        "mro",
+    }
+)
 _SENSITIVE_ENV_KEY_RE = re.compile(
-    r"(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL"
-    r"|^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$)",
+    r"(?:AUTHORIZATION|API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|"
+    r"CREDENTIAL|ACCESS_KEY|SIGNING_KEY|(?:^|_)KEY$|"
+    r"^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$)",
     re.IGNORECASE,
 )
+
+
+class _AwaitableProxy:
+    """Opaque awaitable proxy that hides raw coroutine internals (cr_frame, cr_code, etc.)."""
+
+    __slots__ = ("_coro", "_awaited")
+
+    def __init__(self, coro: Any) -> None:
+        object.__setattr__(self, "_coro", coro)
+        object.__setattr__(self, "_awaited", False)
+
+    def __await__(self) -> Any:
+        object.__setattr__(self, "_awaited", True)
+        return object.__getattribute__(self, "_coro").__await__()
+
+    def __repr__(self) -> str:
+        return "<code-mode awaitable>"
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "__await__":
+            return object.__getattribute__(self, name)
+        raise AttributeError(
+            f"Attribute access '{name}' is not permitted on Code Mode awaitable proxy."
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(
+            f"Attribute assignment '{name}' is not permitted on Code Mode awaitable proxy."
+        )
+
+    def __del__(self) -> None:
+        try:
+            if not object.__getattribute__(self, "_awaited"):
+                coro = object.__getattribute__(self, "_coro")
+                if inspect.iscoroutine(coro):
+                    coro.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class _ToolProxy:
@@ -223,7 +310,10 @@ class _ToolProxy:
         object.__setattr__(self, "_fn", fn)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        return object.__getattribute__(self, "_fn")(*args, **kwargs)
+        res = object.__getattribute__(self, "_fn")(*args, **kwargs)
+        if inspect.iscoroutine(res) or inspect.isawaitable(res):
+            return _AwaitableProxy(res)
+        return res
 
     def __repr__(self) -> str:
         tool_name = object.__getattribute__(self, "_name")
@@ -232,6 +322,11 @@ class _ToolProxy:
     def __getattribute__(self, name: str) -> Any:
         raise AttributeError(
             f"Attribute access '{name}' is not permitted on Code Mode tool proxy."
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(
+            f"Attribute assignment '{name}' is not permitted on Code Mode tool proxy."
         )
 
 
@@ -263,8 +358,32 @@ class _CodeReviewer(ast.NodeVisitor):
         elif node.attr in _FORBIDDEN_ATTRS:
             self._flag(
                 node,
-                f"attribute/method '.{node.attr}' is not allowed in Code Mode — use f-strings instead.",
+                f"attribute/method '.{node.attr}' is not allowed in Code Mode.",
             )
+        self.generic_visit(node)
+
+    def visit_MatchClass(self, node: ast.MatchClass) -> None:
+        for attr in node.kwd_attrs:
+            if attr.startswith("_") or attr in _FORBIDDEN_ATTRS:
+                self._flag(
+                    node,
+                    f"pattern attribute extraction '{attr}' is not allowed in Code Mode.",
+                )
+        self.generic_visit(node)
+
+    def visit_MatchAs(self, node: ast.MatchAs) -> None:
+        if node.name and (node.name in _FORBIDDEN_NAMES or node.name.startswith("__")):
+            self._flag(node, f"name '{node.name}' is not available in Code Mode.")
+        self.generic_visit(node)
+
+    def visit_MatchStar(self, node: ast.MatchStar) -> None:
+        if node.name and (node.name in _FORBIDDEN_NAMES or node.name.startswith("__")):
+            self._flag(node, f"name '{node.name}' is not available in Code Mode.")
+        self.generic_visit(node)
+
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        if node.rest and (node.rest in _FORBIDDEN_NAMES or node.rest.startswith("__")):
+            self._flag(node, f"name '{node.rest}' is not available in Code Mode.")
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
@@ -273,7 +392,7 @@ class _CodeReviewer(ast.NodeVisitor):
 
 
 class _BudgetInjector(ast.NodeTransformer):
-    """모든 루프/함수/컴프리헨션·제너레이터에 `__abyss_tick__()`를 넣어 무한 루프/CPU DoS를 차단합니다."""
+    """모든 루프/함수/람다/컴프리헨션·제너레이터에 `__abyss_tick__()`를 넣어 무한 루프/CPU DoS를 차단합니다."""
 
     @staticmethod
     def _tick_call() -> ast.Call:
@@ -302,6 +421,18 @@ class _BudgetInjector(ast.NodeTransformer):
         self.generic_visit(node)
         for gen in node.generators:
             gen.ifs.insert(0, self._tick_guard())
+        return node
+
+    def visit_Lambda(self, node: ast.Lambda) -> ast.Lambda:
+        self.generic_visit(node)
+        node.body = ast.Subscript(
+            value=ast.Tuple(
+                elts=[self._tick_call(), node.body],
+                ctx=ast.Load(),
+            ),
+            slice=ast.Constant(value=1),
+            ctx=ast.Load(),
+        )
         return node
 
     visit_For = visit_AsyncFor = visit_While = _inject
@@ -575,7 +706,14 @@ class CodeModeExecutor:
             return await ctx.call("Edit", {"path": path, "old": old, "new": new}, impl)
 
         async def gather(*aws: Any) -> list[Any]:
-            return list(await asyncio.gather(*aws))
+            unwrapped: list[Any] = []
+            for aw in aws:
+                if type(aw) is _AwaitableProxy:
+                    object.__setattr__(aw, "_awaited", True)
+                    unwrapped.append(object.__getattribute__(aw, "_coro"))
+                else:
+                    unwrapped.append(aw)
+            return list(await asyncio.gather(*unwrapped))
 
         def _print(*parts: Any) -> None:
             ctx.result.logs.append(" ".join(str(p) for p in parts))

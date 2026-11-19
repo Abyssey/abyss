@@ -355,3 +355,40 @@ def test_agent_runtime_direct_mode_enforces_read_confinement_path_norm_and_ask_g
     assert runtime._verify_tool_isolation("list_files", {"subdir": ".."}).allowed is False
     assert runtime._verify_tool_isolation("write_file", {"path": "sub/../.env", "content": "x"}).allowed is False
     assert runtime._verify_tool_isolation("run_command", {"command": "pip install evilpkg"}).allowed is False
+    # Dual-key alias attack: safe `subdir` paired with escaping `directory` must still be blocked
+    assert runtime._verify_tool_isolation("list_files", {"subdir": ".", "directory": "../../.."}).allowed is False
+    assert runtime._verify_tool_isolation("read_file", {"path": "src/retry_policy.py", "file_path": "../../../.env"}).allowed is False
+
+
+def test_code_mode_blocks_match_class_coroutine_frames_lambda_spin_and_cloud_secrets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "CANARY_AWS_55555")
+    monkeypatch.setenv("DATABASE_PASSWORD", "CANARY_DB_66666")
+    main_root, wt_root = _setup_sample_worktree(tmp_path)
+    executor = CodeModeExecutor(
+        worktree_root=wt_root,
+        main_checkout_root=main_root,
+        foreground_timeout_s=2.0,
+    )
+
+    # 1. ast.MatchClass attribute extraction blocked
+    res_match = executor.run(
+        "match sh:\n    case object(__globals__=g):\n        g\n"
+    )
+    assert res_match.status == "refused_by_review"
+
+    # 2. Coroutine frame inspection via tool proxy blocked
+    res_coro = executor.run("c = read('src/retry_policy.py')\nc.cr_frame")
+    assert res_coro.status == "refused_by_review"
+
+    # 3. Lambda recursion / tight budget caught
+    res_lam = executor.run("f = lambda n: 1 if n <= 0 else f(n - 1)\nf(500000)")
+    assert res_lam.status in ("timeout", "error")
+
+    # 4. Expanded sensitive env vars scrubbed from subprocess sh()
+    res_env = executor.run('(await sh("env")).text')
+    assert res_env.status == "ok"
+    assert "CANARY_AWS_55555" not in str(res_env.return_value)
+    assert "CANARY_DB_66666" not in str(res_env.return_value)
+

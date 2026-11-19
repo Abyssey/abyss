@@ -149,7 +149,7 @@ class EvaluatorRubric:
         re.IGNORECASE,
     )
     _SECRET_LITERAL_RE = re.compile(
-        r"""["'](?:sk-[A-Za-z0-9_-]{6,}|fake-token-[A-Za-z0-9_-]{6,}|AIza[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{12,})["']"""
+        r"""["'](?:sk-[A-Za-z0-9_-]{6,}|glpat-[A-Za-z0-9_-]{6,}|AIza[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{12,})["']"""
     )
     _BARE_EXCEPT_PASS_INLINE_RE = re.compile(
         r"^\s*except(?:\s+Exception(?:\s+as\s+\w+)?)?\s*:\s*(?:pass\b|\.\.\.)"

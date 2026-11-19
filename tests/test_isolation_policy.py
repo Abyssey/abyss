@@ -174,3 +174,38 @@ def test_permission_rules_blocks_quoted_env_escapes_wrappers_and_normalized_path
 
     assert rules.evaluate("Read", "sub/../.env").decision == "deny"
     assert rules.evaluate("Write", "sub/../.env").decision == "deny"
+
+
+def test_r3_posix_wrappers_nested_shell_and_env_short_flags_blocked(tmp_path: Path) -> None:
+    from app.domains.guardrails.permissions import PermissionRules
+
+    main_repo = tmp_path / "repo"
+    wt_dir = main_repo / ".abyss" / "worktrees" / "worker-1"
+    wt_dir.mkdir(parents=True)
+    policy = WorktreeIsolationPolicy(worktree_root=wt_dir, main_checkout_root=main_repo)
+    rules = PermissionRules.default()
+
+    # PermissionRules must peel POSIX negation, control keywords, wrappers, combined env flags, and nested sh -c
+    for cmd in (
+        "! git push origin main",
+        "if true; then git push origin main; fi",
+        "time git push origin main",
+        "timeout 10 git push origin main",
+        "nice -n 5 git push origin main",
+        "sh -c 'git push origin main'",
+        "bash -c 'cd app && git push origin main'",
+    ):
+        assert rules.evaluate("Bash", cmd).decision == "deny", f"Expected deny for {cmd!r}"
+
+    # WorktreeIsolationPolicy must block quoted/escaped eval, CDPATH, env -iC / -S, and nested shell -c
+    for cmd in (
+        "CDPATH=/tmp cd sub",
+        "env -iC /tmp git status",
+        "env -S 'git -C /tmp status'",
+        "'ev'al 'git status'",
+        "sh -c 'cd / && ls'",
+        "bash -c 'cat ../../.env'",
+    ):
+        v = policy.validate_shell_command(cmd)
+        assert v.allowed is False, f"Expected isolation block for {cmd!r}"
+

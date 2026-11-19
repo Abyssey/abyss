@@ -46,7 +46,11 @@ from app.domains.guardrails.isolation_policy import WorktreeIsolationPolicy
 from app.domains.guardrails.permissions import PermissionRules
 from app.domains.workflow.evaluator import EvaluatorRubric
 from app.domains.workflow.worktree_adapter import GitWorktreeManager
-from app.domains.workflow.worktree_tools import build_agent_tools
+from app.domains.workflow.worktree_tools import (
+    _SENSITIVE_ENV_KEY_RE,
+    build_agent_tools,
+    build_safe_subprocess_env,
+)
 
 _TASK_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{4,32}$")
 _GIT_REF_RE = re.compile(r"^[A-Za-z0-9_./@^~:{}-]+$")
@@ -73,6 +77,11 @@ _SNAPSHOT_IGNORE_DIRS = frozenset(
 def _b64_arg(value: str) -> str:
     """Encode arbitrary user text as URL-safe ASCII base64 (zero shell metacharacters)."""
     return base64.urlsafe_b64encode((value or "").encode("utf-8")).decode("ascii")
+
+
+def _build_safe_subprocess_env(pythonpath: str | Path) -> dict[str, str]:
+    """Return a scrubbed subprocess environment with Pod secrets and Git auth config stripped."""
+    return build_safe_subprocess_env(pythonpath=pythonpath)
 
 
 def _validate_git_ref(ref: str, label: str = "git ref") -> str:
@@ -843,9 +852,10 @@ class ServiceCheck:
         return asdict(self)
 
 
-def run_health_checks(root_path: str | Path) -> list[ServiceCheck]:
+def run_health_checks(root_path: str | Path, *, repo_name: str | None = None) -> list[ServiceCheck]:
     """Run real local workspace, Git, Python, test suite, and TLS/config health checks."""
     root = Path(root_path).resolve()
+    display_name = (repo_name or root.name).strip() or root.name
     checks: list[ServiceCheck] = []
 
     # 1. Python runtime
@@ -904,7 +914,7 @@ def run_health_checks(root_path: str | Path) -> list[ServiceCheck]:
     py_count = sum(
         1
         for p in root.rglob("*.py")
-        if ".git" not in p.parts and ".venv" not in p.parts and "__pycache__" not in p.parts and ".abyss" not in p.parts
+        if not (set(p.relative_to(root).parts) & {".git", ".venv", "__pycache__", ".abyss"})
     )
     checks.append(
         ServiceCheck(
@@ -913,7 +923,7 @@ def run_health_checks(root_path: str | Path) -> list[ServiceCheck]:
             category="Codebase",
             status="healthy" if py_count > 0 else "warning",
             latency_ms=round((time.perf_counter() - t0) * 1000, 2),
-            detail=f"활성 Python 모듈 {py_count}개 감지됨 ({root.name})",
+            detail=f"활성 Python 모듈 {py_count}개 감지됨 ({display_name})",
             remediation="" if py_count > 0 else "대상 프로젝트에 .py 소스 파일이 없습니다.",
         )
     )
@@ -921,7 +931,7 @@ def run_health_checks(root_path: str | Path) -> list[ServiceCheck]:
     # 4. Automated tests presence
     t0 = time.perf_counter()
     tests_dir = root / "tests"
-    test_count = len(list(tests_dir.glob("test_*.py"))) if tests_dir.exists() else 0
+    test_count = len(list(tests_dir.rglob("test_*.py"))) if tests_dir.exists() else 0
     checks.append(
         ServiceCheck(
             id="chk-tests",
@@ -1176,7 +1186,7 @@ def generate_inspection_dashboard(
 ) -> dict[str, Any]:
     root = Path(root_path).resolve()
     display_name = (repo_name or root.name).strip() or root.name
-    checks = run_health_checks(root)
+    checks = run_health_checks(root, repo_name=display_name)
     summary = summarize_checks(checks)
     out = Path(output_html)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1682,6 +1692,15 @@ class CodingTaskService:
             mgr._run_git(["commit", "-m", f"chore: snapshot '{local_src.name}' for isolated task build"])
         return mgr, local_src.name, "local_path", ""
 
+    def _collect_runtime_secrets(self) -> tuple[str, ...]:
+        secrets: list[str] = list(self.git_resolver._secrets())
+        for key, val in os.environ.items():
+            if _SENSITIVE_ENV_KEY_RE.search(key):
+                cleaned = val.strip()
+                if len(cleaned) >= 6 and cleaned not in secrets:
+                    secrets.append(cleaned)
+        return tuple(secrets)
+
     # =========================================================================
     # Act 2 Visual Build Execution (`POST /api/workflow/tasks/build`)
     # =========================================================================
@@ -1704,7 +1723,7 @@ class CodingTaskService:
                 "build_cmd": (
                     f"python -m inspection_dashboard.checker --root . "
                     f"--output inspection_dashboard/index.html "
-                    f"--instruction-b64 {inst_b64} --repo-name-b64 {repo_b64}"
+                    f"--instruction-b64={inst_b64} --repo-name-b64={repo_b64}"
                 ),
                 "test_file": "tests/test_inspection_dashboard.py",
                 "preview_rel_path": "inspection_dashboard/index.html",
@@ -1720,7 +1739,7 @@ class CodingTaskService:
                 "build_cmd": (
                     f"python -m custom_feature.builder --root . "
                     f"--output custom_feature/index.html "
-                    f"--instruction-b64 {inst_b64} --repo-name-b64 {repo_b64}"
+                    f"--instruction-b64={inst_b64} --repo-name-b64={repo_b64}"
                 ),
                 "test_file": "tests/test_custom_feature.py",
                 "preview_rel_path": "custom_feature/index.html",
@@ -1736,7 +1755,7 @@ class CodingTaskService:
             "build_cmd": (
                 f"python -m project_map.builder --root . "
                 f"--output project_map/index.html "
-                f"--instruction-b64 {inst_b64} --repo-name-b64 {repo_b64}"
+                f"--instruction-b64={inst_b64} --repo-name-b64={repo_b64}"
             ),
             "test_file": "tests/test_project_map.py",
             "preview_rel_path": "project_map/index.html",
@@ -1795,6 +1814,7 @@ class CodingTaskService:
         registry, schemas = build_agent_tools(
             worktree_root=wt_info.worktree_path,
             agent_id=task_id,
+            main_checkout_root=mgr.repo_root,
         )
 
         code_mode_executor: CodeModeExecutor | None = None
@@ -1951,10 +1971,8 @@ class CodingTaskService:
             llm_callable=llm_bridge,
         )
 
-        # Authoritative pytest verification inside the isolated worktree (cache disabled)
-        pytest_env = os.environ.copy()
-        pytest_env["PYTHONPATH"] = str(wt_info.worktree_path)
-        pytest_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # Authoritative pytest verification inside the isolated worktree (cache disabled, secrets scrubbed)
+        pytest_env = _build_safe_subprocess_env(wt_info.worktree_path)
         pytest_proc = subprocess.run(
             [
                 sys.executable,
@@ -1971,7 +1989,8 @@ class CodingTaskService:
             text=True,
             check=False,
         )
-        pytest_output = ((pytest_proc.stdout or "") + (pytest_proc.stderr or "")).strip()
+        raw_pytest_output = ((pytest_proc.stdout or "") + (pytest_proc.stderr or "")).strip()
+        pytest_output = sanitize_git_text(raw_pytest_output, secrets=self._collect_runtime_secrets())
         tests_passed = pytest_proc.returncode == 0
 
         # Commit changes cleanly inside the worktree branch (never mutates main!)
@@ -2168,24 +2187,25 @@ class CodingTaskService:
                 check=False,
             )
             if add_res.returncode != 0:
+                safe_err = sanitize_git_text(
+                    add_res.stderr.strip(), secrets=self._collect_runtime_secrets()
+                )
                 return {
                     "exit_code": add_res.returncode,
                     "passed": False,
-                    "output": f"Could not checkout detached review worktree: {add_res.stderr.strip()}",
+                    "output": f"Could not checkout detached review worktree: {safe_err}",
                 }
             run_dir = ephemeral_wt
 
             tests_dir = run_dir / "tests"
-            if not tests_dir.exists() or not list(tests_dir.glob("test_*.py")):
+            if not tests_dir.exists() or not list(tests_dir.rglob("test_*.py")):
                 return {
                     "exit_code": 0,
                     "passed": True,
                     "output": "No pytest test files discovered in branch.",
                 }
 
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(run_dir)
-            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            env = _build_safe_subprocess_env(run_dir)
             proc = subprocess.run(
                 [
                     sys.executable,
@@ -2203,10 +2223,12 @@ class CodingTaskService:
                 timeout=45,
                 check=False,
             )
+            raw_out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+            safe_out = sanitize_git_text(raw_out, secrets=self._collect_runtime_secrets())
             return {
                 "exit_code": proc.returncode,
                 "passed": proc.returncode == 0,
-                "output": ((proc.stdout or "") + (proc.stderr or "")).strip()[-2000:],
+                "output": safe_out[-2000:],
             }
         finally:
             if ephemeral_wt is not None:

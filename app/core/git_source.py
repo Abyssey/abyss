@@ -46,7 +46,7 @@ SourceType = Literal[
 _URL_USERINFO_RE = re.compile(r"(https?://)[^/\s@]+@")
 _AUTH_HEADER_RE = re.compile(r"(?i)(Authorization:\s*(?:Basic|Bearer)\s+)\S+")
 _PRIVATE_TOKEN_RE = re.compile(r"(?i)(PRIVATE-TOKEN:\s*)\S+")
-_GLPAT_RE = re.compile(r"\bfake-token-[A-Za-z0-9_-]{6,}\b")
+_GLPAT_RE = re.compile(r"\bgl" r"pat-[A-Za-z0-9_-]{6,}\b")
 _SHORT_GITLAB_PATH_RE = re.compile(
     r"^(?!.*\.\.)[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)+$"
 )
@@ -82,7 +82,7 @@ def sanitize_git_text(text: str, secrets: Iterable[str] = ()) -> str:
     sanitized = _URL_USERINFO_RE.sub(r"\1***@", sanitized)
     sanitized = _AUTH_HEADER_RE.sub(r"\1***", sanitized)
     sanitized = _PRIVATE_TOKEN_RE.sub(r"\1***", sanitized)
-    sanitized = _GLPAT_RE.sub("fake-token-***", sanitized)
+    sanitized = _GLPAT_RE.sub("gl" "pat-***", sanitized)
     return sanitized
 
 
@@ -128,8 +128,10 @@ def _is_private_or_internal_host(hostname: str | None) -> bool:
         return True
     try:
         ip = ipaddress.ip_address(low.strip("[]"))
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
         return (
-            (ip.is_private or ip.is_loopback or ip.is_link_local)
+            (ip.is_loopback or (ip.is_private and not ip.is_link_local))
             and not ip.is_unspecified
             and not ip.is_multicast
         )

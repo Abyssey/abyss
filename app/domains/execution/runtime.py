@@ -222,29 +222,55 @@ class AgentRuntime:
             )
 
         if tool_name in ("write_file", "edit_file", "delete_file"):
-            target = str(args.get("path") or args.get("file_path") or "")
-            norm_target = self._normalize_target_for_permissions(target)
+            targets = [
+                str(args[k]) for k in ("path", "file_path") if args.get(k) is not None
+            ] or [""]
             perm_tool = "Write" if tool_name == "write_file" else "Edit"
-            perm_verdict = self._check_permission(perm_tool, norm_target, args)
-            if perm_verdict is not None:
-                return perm_verdict
-            return self.policy.validate_file_edit(target)
+            last_verdict: PolicyVerdict | None = None
+            for target in targets:
+                norm_target = self._normalize_target_for_permissions(target)
+                perm_verdict = self._check_permission(perm_tool, norm_target, args)
+                if perm_verdict is not None:
+                    return perm_verdict
+                verdict = self.policy.validate_file_edit(target)
+                if not verdict.allowed:
+                    return verdict
+                last_verdict = verdict
+            return last_verdict or self.policy.validate_file_edit("")
 
         if tool_name == "read_file":
-            target = str(args.get("path") or args.get("file_path") or "")
-            norm_target = self._normalize_target_for_permissions(target)
-            perm_verdict = self._check_permission("Read", norm_target, args)
-            if perm_verdict is not None:
-                return perm_verdict
-            return self.policy.validate_file_read(target)
+            targets = [
+                str(args[k]) for k in ("path", "file_path") if args.get(k) is not None
+            ] or [""]
+            last_verdict = None
+            for target in targets:
+                norm_target = self._normalize_target_for_permissions(target)
+                perm_verdict = self._check_permission("Read", norm_target, args)
+                if perm_verdict is not None:
+                    return perm_verdict
+                verdict = self.policy.validate_file_read(target)
+                if not verdict.allowed:
+                    return verdict
+                last_verdict = verdict
+            return last_verdict or self.policy.validate_file_read("")
 
         if tool_name == "list_files":
-            target = str(args.get("subdir") or args.get("directory") or args.get("path") or ".")
-            norm_target = self._normalize_target_for_permissions(target)
-            perm_verdict = self._check_permission("Glob", norm_target, args)
-            if perm_verdict is not None:
-                return perm_verdict
-            return self.policy.validate_file_read(target)
+            targets = [
+                str(args[k])
+                for k in ("subdir", "directory", "path")
+                if args.get(k) is not None
+            ] or ["."]
+            last_verdict = None
+            for target in targets:
+                norm_target = self._normalize_target_for_permissions(target)
+                perm_verdict = self._check_permission("Glob", norm_target, args)
+                if perm_verdict is not None:
+                    return perm_verdict
+                verdict = self.policy.validate_file_read(target)
+                if not verdict.allowed:
+                    return verdict
+                last_verdict = verdict
+            return last_verdict or self.policy.validate_file_read(".")
 
         if tool_name == "run_command":
             command = str(args.get("command", ""))
