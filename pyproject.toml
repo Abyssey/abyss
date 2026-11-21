@@ -34,3 +34,6 @@ pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+markers = [
+    "live_llm: Live LLM end-to-end verification tests (requires GEMINI_API_KEY and live network)",
+]

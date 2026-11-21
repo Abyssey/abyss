@@ -13,6 +13,8 @@
   - High-density developer workspace aligned with modern coding agent control planes (`open-swe`, Claude Code, Codex)
   - Zero decorative slop: no purple-to-blue hero gradients, no nested cards inside cards, crisp inline SVG icons only
   - Clear visual separation between **Focus Domains (`app/domains/guardrails/`, `app/domains/execution/`)** highlighted in Amber Gold and **Supporting Domains & Shared Kernel (`workflow`, `onboarding`, `core`)**
+  - Prominent **Engine & Live LLM Status Pills** in the top bar (`langchain-ai/deepagents v0.7` + `🟢 LIVE LLM` / `⛔ LLM CONFIG REQUIRED` fail-fast guidance banner)
+  - **Antigravity 3-Phase Artifact Cards** (`implementation_plan.md` with inline comment + **Proceed** approval bar for `request_review`, `task.md` synced from `write_todos`, and `pytest`-stamped `walkthrough.md`) paired with `Turn N: Tool -> Observation` & Dual Gate telemetry
   - Sandboxed Live Preview for built HTML artifacts using `<iframe sandbox="allow-scripts">` (never granting `allow-same-origin`) paired with an explicit `"새 탭으로 열기"` link
 
 ## 2. Color Tokens (Mapped to `@astryxdesign/theme-neutral` & `oklch`)

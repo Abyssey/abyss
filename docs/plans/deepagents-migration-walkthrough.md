@@ -210,3 +210,26 @@ $ GEMINI_ENABLED=false QWEN_ENABLED=false OPENAI_ENABLED=false .venv/bin/pytest 
 $ node --check app/static/app.js && GEMINI_ENABLED=false QWEN_ENABLED=false OPENAI_ENABLED=false .venv/bin/pytest -q
 104 passed in 34.81s
 ```
+
+---
+
+## Phase 8 — 아키텍처 규칙, `test_live_llm.py`, 문서 & PR
+
+### Changes Made
+- [MODIFY] [test_ddd_architecture.py](../../tests/test_ddd_architecture.py):
+  - Rule #8 추가: `runtime.py`가 `create_deep_agent`, `ArtifactWorkflowMiddleware`, `PlanGateMiddleware`를 AST 상 실제로 import·호출하는지 검증하고, 수동 `while` 에이전트 루프, 구 `AgentRuntime`/`HandoffArtifact`, `mock_responder`, `seed_templates`, `deepagents_adapter`, 테스트 더블(`helpers_llm_doubles`, `ScriptedDeepAgentChatModel`)이 `app/` 아래에 단 한 줄도 존재하지 않음을 강제.
+  - Builder(`task_service.py`) 및 Worker(`coordinator.py`) 경로가 `workflow="planning"`(`ArtifactWorkflowMiddleware`)을 거치는지 검증.
+  - 신규 라우트 3종(`/api/code-mode/agent`, `/api/workflow/tasks/{task_id}`, `/api/workflow/tasks/{task_id}/plan/approve`) OpenAPI 등록 검증 추가.
+- [NEW] [test_live_llm.py](../../tests/test_live_llm.py) & [MODIFY] [pyproject.toml](../../pyproject.toml):
+  - `live_llm` 마커 등록 및 `GEMINI_API_KEY` 미설정(또는 `GEMINI_ENABLED=false`) 시 자동 skip되는 실제 Gemini 기반 할인율 버그 수정 + Antigravity 3종 산출물 E2E 테스트 추가.
+- [MODIFY] [README.md](../../README.md), [DESIGN.md](../../DESIGN.md), [PRESENTATION_GUIDE.md](../PRESENTATION_GUIDE.md), [demo.sh](../../scripts/demo.sh):
+  - `langchain-ai/deepagents v0.7` 단일 엔진 구조, HTTP 503(`⛔ LLM CONFIG REQUIRED`) Fail-Fast 정책, `request_review` Plan 승인 API(`/plan/approve`), `POST /api/code-mode/agent`, `.venv/bin/pytest -m live_llm -v` 실행 가이드 반영.
+
+### Validation Results
+```text
+$ bash -n scripts/demo.sh && grep -rnE "mock_responder|seed_templates|deepagents_adapter|PROJECT_MAP_BUILDER_CODE|_build_worker_scripted_responder" app/
+(0 matches)
+
+$ GEMINI_ENABLED=false QWEN_ENABLED=false OPENAI_ENABLED=false .venv/bin/pytest -q
+105 passed, 1 skipped in 34.35s
+```

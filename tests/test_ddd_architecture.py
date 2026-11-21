@@ -2,12 +2,16 @@
 tests/test_ddd_architecture.py
 Modern Python DDD Modular Monolith AST Dependency & Contract Verification Suite.
 
-Enforces all 5 strict AST architectural boundary rules:
+Enforces strict AST architectural boundary rules:
   1. `app/domains/guardrails/*.py`: pure Python stdlib + `app.domains.guardrails.*` ONLY (and NO `router.py`).
-  2. `app/domains/execution/{code_mode,runtime}.py`: pure Python stdlib + `app.domains.guardrails.*` + `app.domains.execution.{code_mode,runtime}` ONLY.
+  2. `app/domains/execution/code_mode.py`: pure Python stdlib + `app.domains.guardrails.*` ONLY;
+     `app/domains/execution/{runtime,deepagent_backend,artifact_workflow}.py`: stdlib + `guardrails` +
+     `deepagents`/`langchain*`/`langgraph`/`pydantic`, ZERO `workflow`/`onboarding`/`app.core`/`fastapi` imports.
   3. `app/domains/workflow/evaluator.py`: pure Python stdlib ONLY.
   4. `app/domains/onboarding/*.py`: ZERO imports from `app.domains.{workflow,execution,guardrails}`, `app.core.llm`, `app.main`, `abyss`.
   5. Every `router.py`: ONLY stdlib, `fastapi`, `starlette`, `pydantic`, `app.core.container`, and its own package.
+  8. Single `langchain-ai/deepagents` engine (`create_deep_agent` + `ArtifactWorkflowMiddleware`),
+     ZERO manual `while` agent loops, ZERO legacy `AgentRuntime`/`mock_responder`/`seed_templates` in `app/`.
 Also verifies:
   - Legacy `abyss/`, `app/{domain,application,infrastructure,api}/`, and root `PROJECT.md` are removed.
   - `GET /api/learning-core` serves all 5 live Modern DDD core modules + 4 supporting modules on disk.
@@ -460,12 +464,15 @@ def test_fastapi_registers_all_modern_ddd_and_pod_routes() -> None:
         "/api/workflow/run",
         "/api/workflow/tasks/presets",
         "/api/workflow/tasks/build",
+        "/api/workflow/tasks/{task_id}",
+        "/api/workflow/tasks/{task_id}/plan/approve",
         "/api/workflow/tasks/review",
         "/api/workflow/tasks/{task_id}/preview",
         "/api/events/stream",
         "/api/learning-core",
         "/api/code-mode/scenarios",
         "/api/code-mode/run",
+        "/api/code-mode/agent",
         "/api/providers/config",
         "/api/providers/test/{provider_id}",
         "/api/repo-onboard/analyze",
@@ -474,6 +481,68 @@ def test_fastapi_registers_all_modern_ddd_and_pod_routes() -> None:
     assert expected_api_paths.issubset(openapi_paths)
     mount_paths = {getattr(r, "path", "") for r in app.routes}
     assert "/static" in mount_paths
+
+
+def test_rule_8_deepagents_single_engine_artifact_workflow_and_zero_legacy_loops() -> None:
+    runtime_path = APP_DIR / "domains" / "execution" / "runtime.py"
+    runtime_src = runtime_path.read_text(encoding="utf-8")
+    runtime_tree = ast.parse(runtime_src, filename=str(runtime_path))
+
+    # 1. `runtime.py` must import and invoke `create_deep_agent` and wire `ArtifactWorkflowMiddleware`
+    runtime_imports = _resolve_file_imports(runtime_path)
+    assert "deepagents.create_deep_agent" in runtime_imports
+    assert "app.domains.execution.artifact_workflow.ArtifactWorkflowMiddleware" in runtime_imports
+
+    call_names: set[str] = set()
+    class_names: set[str] = set()
+    for node in ast.walk(runtime_tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                call_names.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                call_names.add(node.func.attr)
+        elif isinstance(node, ast.ClassDef):
+            class_names.add(node.name)
+        elif isinstance(node, ast.While):
+            raise AssertionError(
+                f"AST Rule #8 Violation: manual `while` loop found in runtime.py at line {node.lineno}"
+            )
+
+    assert "create_deep_agent" in call_names
+    assert "ArtifactWorkflowMiddleware" in call_names
+    assert "PlanGateMiddleware" in call_names
+    assert "AgentRuntime" not in class_names
+    assert "HandoffArtifact" not in class_names
+
+    # 2. Builder (`task_service.py`) and Worker (`coordinator.py`) paths must use `DeepAgentRuntime` in `planning` mode
+    task_svc_src = (APP_DIR / "domains" / "workflow" / "task_service.py").read_text(encoding="utf-8")
+    coord_src = (APP_DIR / "domains" / "workflow" / "coordinator.py").read_text(encoding="utf-8")
+    assert 'mode="builder"' in task_svc_src and 'workflow="planning"' in task_svc_src
+    assert 'mode="worker"' in coord_src and 'workflow="planning"' in coord_src
+
+    # 3. Deleted legacy files & banned symbols must not exist anywhere under `app/`
+    for deleted_rel in (
+        "domains/workflow/seed_templates.py",
+        "domains/workflow/deepagents_adapter.py",
+        "domains/workflow/worktree_tools.py",
+    ):
+        assert not (APP_DIR / deleted_rel).exists(), f"Deleted legacy module reappeared: app/{deleted_rel}"
+
+    banned_tokens = (
+        "mock_responder",
+        "seed_templates",
+        "deepagents_adapter",
+        "PROJECT_MAP_BUILDER_CODE",
+        "_build_worker_scripted_responder",
+        "helpers_llm_doubles",
+        "ScriptedDeepAgentChatModel",
+    )
+    for py_file in sorted(APP_DIR.rglob("*.py")):
+        src = py_file.read_text(encoding="utf-8")
+        for token in banned_tokens:
+            assert token not in src, (
+                f"AST Rule #8 Violation: banned legacy/test symbol '{token}' found in {py_file.relative_to(REPO_ROOT)}"
+            )
 
 
 def test_evaluator_rubric_scoring_weights_and_gate() -> None:
