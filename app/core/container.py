@@ -50,16 +50,19 @@ def build_container(
         rotator=rotator,
         bare_remote_path=effective_settings.internal_bare_remote,
         settings=effective_settings,
+        model_factory=rotator.build_chat_model,
     )
     task_service = CodingTaskService(
         settings=effective_settings,
         rotator=rotator,
         event_callback=coordinator.emit_event,
+        model_factory=rotator.build_chat_model,
     )
     code_mode_service = CodeModeLabService(
         sandbox_root=effective_settings.code_mode_sandbox,
         main_checkout_root=effective_settings.demo_workspace,
         event_callback=coordinator.emit_event,
+        model_factory=rotator.build_chat_model,
     )
     catalog_service = ArchitectureCatalogService(repo_root=effective_settings.repo_root)
     onboarding_service = OnboardingService(settings=effective_settings)

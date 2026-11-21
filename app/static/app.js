@@ -40,6 +40,7 @@ const state = {
   lastBuildResult: null,
   lastBuildTargetRepo: 'demo',
   lastReviewResult: null,
+  lastCodeModeAgentResponse: null,
 };
 
 const escapeHtml = (raw = '') =>
@@ -48,6 +49,96 @@ const escapeHtml = (raw = '') =>
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;');
+
+function formatInlineMarkdown(escapedLine = '') {
+  return escapedLine
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+}
+
+function renderSafeMarkdown(mdText = '', emptyFallback = '내용이 없습니다.') {
+  const cleaned = String(mdText || '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .trim();
+  if (!cleaned) {
+    return `<div style="color: var(--color-text-muted);">${escapeHtml(emptyFallback)}</div>`;
+  }
+  const lines = cleaned.split('\n');
+  const htmlParts = [];
+  let inCodeFence = false;
+  let codeLines = [];
+  let listItems = [];
+
+  const flushList = () => {
+    if (listItems.length) {
+      htmlParts.push(`<ul>${listItems.join('')}</ul>`);
+      listItems = [];
+    }
+  };
+
+  for (const rawLine of lines) {
+    if (rawLine.trim().startsWith('```')) {
+      flushList();
+      if (inCodeFence) {
+        htmlParts.push(`<pre>${escapeHtml(codeLines.join('\n'))}</pre>`);
+        codeLines = [];
+        inCodeFence = false;
+      } else {
+        inCodeFence = true;
+      }
+      continue;
+    }
+    if (inCodeFence) {
+      codeLines.push(rawLine);
+      continue;
+    }
+    const trimmed = rawLine.trim();
+    if (!trimmed) {
+      flushList();
+      continue;
+    }
+    const escaped = escapeHtml(trimmed);
+    if (escaped.startsWith('### ')) {
+      flushList();
+      htmlParts.push(`<h3>${formatInlineMarkdown(escaped.slice(4))}</h3>`);
+    } else if (escaped.startsWith('## ')) {
+      flushList();
+      htmlParts.push(`<h2>${formatInlineMarkdown(escaped.slice(3))}</h2>`);
+    } else if (escaped.startsWith('# ')) {
+      flushList();
+      htmlParts.push(`<h1>${formatInlineMarkdown(escaped.slice(2))}</h1>`);
+    } else if (escaped.startsWith('- ') || escaped.startsWith('* ')) {
+      listItems.push(`<li>${formatInlineMarkdown(escaped.slice(2))}</li>`);
+    } else {
+      flushList();
+      htmlParts.push(`<div>${formatInlineMarkdown(escaped)}</div>`);
+    }
+  }
+  flushList();
+  if (inCodeFence && codeLines.length) {
+    htmlParts.push(`<pre>${escapeHtml(codeLines.join('\n'))}</pre>`);
+  }
+  return htmlParts.join('');
+}
+
+function updateLlmStatusIndicator(rotator) {
+  const statusBadge = document.getElementById('llm-status-badge');
+  const warningStrip = document.getElementById('llm-config-warning-banner');
+  if (!rotator) return;
+
+  const hasLive = Boolean(rotator.has_live_credentials);
+  const bannerText =
+    rotator.status_banner ||
+    (hasLive ? '🟢 LIVE LLM' : '⛔ LLM CONFIG REQUIRED');
+
+  if (statusBadge) {
+    statusBadge.textContent = bannerText;
+    statusBadge.setAttribute('data-tone', hasLive ? 'success' : 'danger');
+  }
+  if (warningStrip) {
+    warningStrip.setAttribute('data-visible', String(!hasLive));
+  }
+}
 
 function formatColorizedDiff(diffText = '', maxLines = 240) {
   if (!diffText) return 'No diff recorded.';
@@ -89,7 +180,8 @@ async function apiFetch(url, options = {}, timeoutMs = 25000) {
   });
   if (!response.ok) {
     const errBody = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(errBody.detail || `HTTP ${response.status}`);
+    const prefix = errBody.error ? `${errBody.error} — ` : '';
+    throw new Error(`${prefix}${errBody.detail || `HTTP ${response.status}`}`);
   }
   return response.json();
 }
@@ -265,6 +357,29 @@ function renderSelectedCoreCode() {
 /* ============================================================================
  * Tab 2: Act 2 Visual Build Result + Embedded Sandboxed Live Preview
  * ============================================================================ */
+function renderTurnTraceList(turnTrace = []) {
+  if (!turnTrace.length) {
+    return '<div style="font-size: 12px; color: var(--color-text-muted);">도구 실행 기록이 없습니다.</div>';
+  }
+  return turnTrace
+    .map((entry) => {
+      const st = entry.status || 'ok';
+      const kind = st === 'blocked' ? 'isolation_blocked' : 'tool_executed';
+      const tone = st === 'blocked' ? 'danger' : st === 'error' ? 'core' : 'success';
+      const argsPreview = JSON.stringify(entry.arguments || {}).slice(0, 140);
+      return `
+        <article class="stream-item" data-kind="${kind}">
+          <div class="stream-meta">
+            <span><strong>Turn ${entry.turn ?? '?'} · ${escapeHtml(entry.tool_name || '')}</strong> <code>${escapeHtml(argsPreview)}</code></span>
+            <span class="badge" data-tone="${tone}">${escapeHtml(st.toUpperCase())}</span>
+          </div>
+          <div class="stream-body">${escapeHtml((entry.observation || '').slice(0, 360))}</div>
+        </article>
+      `;
+    })
+    .join('');
+}
+
 function renderBuildTaskResult() {
   const res = state.lastBuildResult;
   const emptyEl = document.getElementById('build-result-empty');
@@ -274,25 +389,63 @@ function renderBuildTaskResult() {
   if (!res || !emptyEl || !contentEl) return;
 
   emptyEl.style.display = 'none';
-  contentEl.style.display = 'grid';
+  contentEl.style.display = 'flex';
 
+  const isAwaiting = res.status === 'awaiting_plan_review';
   const passed = Boolean(res.test_result?.passed);
   const checks = Array.isArray(res.guardrail_checks) ? res.guardrail_checks : [];
   const passedChecks = checks.filter((c) => c.allowed !== false).length;
 
   statusBadge.textContent = `${String(res.status || 'completed').toUpperCase()} · ${res.branch_name}`;
-  statusBadge.setAttribute('data-tone', res.status === 'completed' ? 'success' : 'danger');
+  statusBadge.setAttribute(
+    'data-tone',
+    res.status === 'completed' ? 'success' : isAwaiting ? 'core' : 'danger'
+  );
 
   if (jumpBtn) {
-    jumpBtn.style.display = res.branch_name ? 'inline-flex' : 'none';
+    jumpBtn.style.display = res.status === 'completed' && res.branch_name ? 'inline-flex' : 'none';
+  }
+
+  // Antigravity Plan Review Approval Gate (`request_review`)
+  const approvalBox = document.getElementById('plan-approval-box');
+  if (approvalBox) {
+    approvalBox.style.display = isAwaiting ? 'flex' : 'none';
+  }
+
+  // Antigravity 3-Phase Markdown Artifacts
+  const artifacts = res.artifacts || {};
+  const planViewer = document.getElementById('artifact-plan-viewer');
+  const taskViewer = document.getElementById('artifact-task-viewer');
+  const wtViewer = document.getElementById('artifact-walkthrough-viewer');
+  if (planViewer) {
+    planViewer.innerHTML = renderSafeMarkdown(
+      artifacts.implementation_plan,
+      '아직 implementation_plan.md가 생성되지 않았습니다.'
+    );
+  }
+  if (taskViewer) {
+    const fallbackTodos = (res.todos || [])
+      .map((t) => `- [${t.status === 'completed' ? 'x' : t.status === 'in_progress' ? '/' : ' '}] ${t.content}`)
+      .join('\n');
+    taskViewer.innerHTML = renderSafeMarkdown(
+      artifacts.task || fallbackTodos,
+      '아직 등록된 write_todos 항목이 없습니다.'
+    );
+  }
+  if (wtViewer) {
+    wtViewer.innerHTML = renderSafeMarkdown(
+      artifacts.walkthrough,
+      isAwaiting ? 'Proceed 승인 및 검증 통과 후 생성됩니다.' : 'walkthrough.md가 없습니다.'
+    );
   }
 
   document.getElementById('build-result-meta').innerHTML = `
+    <span class="badge" data-tone="core">engine: langchain-ai/deepagents v0.7</span>
     <span class="badge" data-tone="info">branch: ${escapeHtml(res.branch_name)}</span>
     <span class="badge" data-tone="core">preset: ${escapeHtml(res.preset)}</span>
     <span class="badge">repo: ${escapeHtml(res.repo_name)} (${escapeHtml(res.source_type)})</span>
-    <span class="badge" data-tone="${passed ? 'success' : 'danger'}">
-      pytest: ${passed ? 'PASS' : 'FAIL'} (exit ${res.test_result?.exit_code ?? -1})
+    <span class="badge" data-tone="${isAwaiting ? 'core' : passed ? 'success' : 'danger'}">
+      pytest: ${isAwaiting ? 'PENDING APPROVAL' : passed ? 'PASS' : 'FAIL'} (exit ${res.test_result?.exit_code ?? 0})
     </span>
     <span class="badge" data-tone="success">Guardrails: ${passedChecks}/${checks.length} PASS</span>
     <span class="badge" data-tone="${res.pushed_to_remote ? 'success' : 'info'}">
@@ -306,6 +459,54 @@ function renderBuildTaskResult() {
   document.getElementById('build-changed-files').innerHTML = (res.changed_files || [])
     .map((f) => `<span class="file-pill">${escapeHtml(f)}</span>`)
     .join('');
+
+  // Gates (`PytestGateMiddleware` + `RubricMiddleware`) & Subagent calls
+  const gatesViewer = document.getElementById('build-gates-subagents-viewer');
+  if (gatesViewer) {
+    const gateItems = [
+      ...(res.pytest_gate_runs || []).map(
+        (g) => `
+          <div class="stream-item" data-kind="${g.passed ? 'review_completed' : 'isolation_blocked'}">
+            <div class="stream-meta">
+              <span><strong>PytestGate #${g.iteration}</strong> <code>${escapeHtml(g.command || 'pytest')}</code></span>
+              <span class="badge" data-tone="${g.passed ? 'success' : 'danger'}">${g.passed ? 'PASSED' : `EXIT ${g.exit_code}`}</span>
+            </div>
+            <div class="stream-body">${escapeHtml((g.output || '').slice(-320))}</div>
+          </div>
+        `
+      ),
+      ...(res.rubric_evaluations || []).map(
+        (rv) => `
+          <div class="stream-item" data-kind="${rv.result === 'satisfied' ? 'review_completed' : 'thinking'}">
+            <div class="stream-meta">
+              <span><strong>RubricMiddleware #${rv.iteration ?? 1}</strong></span>
+              <span class="badge" data-tone="${rv.result === 'satisfied' ? 'success' : 'core'}">${escapeHtml(String(rv.result || '').toUpperCase())}</span>
+            </div>
+            <div class="stream-body">${escapeHtml(rv.explanation || '')}</div>
+          </div>
+        `
+      ),
+      ...(res.subagent_calls || []).map(
+        (sub) => `
+          <div class="stream-item" data-kind="thinking">
+            <div class="stream-meta">
+              <span><strong>Subagent task &rarr; ${escapeHtml(sub.subagent_type)}</strong> (Turn ${sub.turn})</span>
+              <span class="badge" data-tone="info">Isolated Context</span>
+            </div>
+            <div class="stream-body">${escapeHtml(sub.description || '')}\n${escapeHtml((sub.response_preview || '').slice(0, 220))}</div>
+          </div>
+        `
+      ),
+    ];
+    gatesViewer.innerHTML =
+      gateItems.join('') ||
+      '<div style="font-size: 12px; color: var(--color-text-muted);">Proceed 실행 후 게이트 및 서브에이전트 결과가 표시됩니다.</div>';
+  }
+
+  const traceViewer = document.getElementById('build-turn-trace-viewer');
+  if (traceViewer) {
+    traceViewer.innerHTML = renderTurnTraceList(res.turn_trace || []);
+  }
 
   document.getElementById('build-diff-viewer').innerHTML = formatColorizedDiff(res.git_diff || '', 260);
   document.getElementById('build-pytest-viewer').textContent =
@@ -332,6 +533,59 @@ function renderBuildTaskResult() {
   }
 }
 
+async function approveBuildPlan(proceed = true) {
+  const current = state.lastBuildResult;
+  if (!current?.task_id) return;
+  const proceedBtn = document.getElementById('approve-plan-proceed-btn');
+  const reviseBtn = document.getElementById('approve-plan-revise-btn');
+  const commentInput = document.getElementById('plan-review-comment-input');
+  const runBadge = document.getElementById('run-status-badge');
+
+  const comments = (commentInput?.value || '').trim();
+  if (!proceed && !comments) {
+    setBannerError('build-error-banner', '계획 수정 요청 시 코멘트를 입력해 주세요.');
+    return;
+  }
+
+  setBannerError('build-error-banner', '');
+  if (proceedBtn) proceedBtn.disabled = true;
+  if (reviseBtn) reviseBtn.disabled = true;
+  if (runBadge) {
+    runBadge.textContent = proceed ? 'EXECUTING APPROVED PLAN...' : 'REVISING PLAN...';
+    runBadge.setAttribute('data-tone', 'info');
+  }
+
+  try {
+    const res = await apiFetch(
+      `/api/workflow/tasks/${encodeURIComponent(current.task_id)}/plan/approve`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ proceed, comments }),
+      },
+      90000
+    );
+    state.lastBuildResult = res;
+    if (commentInput) commentInput.value = '';
+    renderBuildTaskResult();
+    if (runBadge) {
+      const waiting = res.status === 'awaiting_plan_review';
+      runBadge.textContent = waiting
+        ? `PLAN REVISED (${res.task_id}) · AWAITING PROCEED`
+        : `BUILT ${res.branch_name} · ${res.status.toUpperCase()}`;
+      runBadge.setAttribute('data-tone', waiting ? 'core' : res.status === 'completed' ? 'success' : 'danger');
+    }
+  } catch (err) {
+    setBannerError('build-error-banner', `계획 승인/재개 실패: ${err.message}`);
+    if (runBadge) {
+      runBadge.textContent = 'PLAN RESUME ERROR';
+      runBadge.setAttribute('data-tone', 'danger');
+    }
+  } finally {
+    if (proceedBtn) proceedBtn.disabled = false;
+    if (reviseBtn) reviseBtn.disabled = false;
+  }
+}
+
 async function runBuildTask(overrides = {}) {
   const buildBtn = document.getElementById('run-build-task-btn');
   const quickBtn = document.getElementById('tab2-quick-build-btn');
@@ -342,6 +596,7 @@ async function runBuildTask(overrides = {}) {
   const instInput = document.getElementById('build-instruction-input');
   const pushCb = document.getElementById('build-push-remote-cb');
   const cmCb = document.getElementById('build-codemode-cb');
+  const planReviewSelect = document.getElementById('build-plan-review-select');
 
   const preset = overrides.preset || state.selectedBuildPreset || 'project_map_app';
   if (overrides.preset && BUILD_PRESETS[overrides.preset]) {
@@ -355,6 +610,7 @@ async function runBuildTask(overrides = {}) {
     fallbackInstruction;
   const pushToRemote = overrides.push_to_remote ?? Boolean(pushCb?.checked);
   const useCodeMode = overrides.use_code_mode ?? Boolean(cmCb?.checked);
+  const planReview = overrides.plan_review ?? planReviewSelect?.value ?? 'request_review';
 
   setBannerError('build-error-banner', '');
   if (buildBtn) buildBtn.disabled = true;
@@ -376,6 +632,7 @@ async function runBuildTask(overrides = {}) {
           preset,
           push_to_remote: pushToRemote,
           use_code_mode: useCodeMode,
+          plan_review: planReview,
         }),
       },
       90000
@@ -393,8 +650,13 @@ async function runBuildTask(overrides = {}) {
     switchTab('panel-worktrees');
 
     if (runBadge) {
-      runBadge.textContent = `BUILT ${res.branch_name} · PREVIEW READY`;
-      runBadge.setAttribute('data-tone', 'success');
+      if (res.status === 'awaiting_plan_review') {
+        runBadge.textContent = `AWAITING PLAN APPROVAL (${res.task_id})`;
+        runBadge.setAttribute('data-tone', 'core');
+      } else {
+        runBadge.textContent = `BUILT ${res.branch_name} · PREVIEW READY`;
+        runBadge.setAttribute('data-tone', 'success');
+      }
     }
   } catch (err) {
     setBannerError('build-error-banner', `빌드 실행 실패: ${err.message}`);
@@ -414,13 +676,44 @@ async function runBuildTask(overrides = {}) {
  * ============================================================================ */
 function renderWorktreesAndTasks() {
   if (!state.dashboard) return;
-  const { tasks = [], worktrees = {}, git_graph: gitGraph = [], rotator, handoffs = {} } = state.dashboard;
+  const {
+    tasks = [],
+    worktrees = {},
+    git_graph: gitGraph = [],
+    rotator,
+    handoffs = {},
+    lead_todos: leadTodos = [],
+    team_artifacts: teamArtifacts = {},
+  } = state.dashboard;
+
+  updateLlmStatusIndicator(rotator);
+
+  const teamPanel = document.getElementById('team-artifacts-panel');
+  if (teamPanel) {
+    const hasTeamArtifacts = Boolean(teamArtifacts.implementation_plan || teamArtifacts.walkthrough);
+    teamPanel.style.display = hasTeamArtifacts ? 'flex' : 'none';
+    if (hasTeamArtifacts) {
+      const todoMd = leadTodos
+        .map((t) => `- [${t.status === 'completed' ? 'x' : ' '}] ${t.content}`)
+        .join('\n');
+      const combinedPlan = [teamArtifacts.implementation_plan || '', todoMd ? `\n## Lead TodoList\n${todoMd}` : '']
+        .filter(Boolean)
+        .join('\n');
+      document.getElementById('team-plan-viewer').innerHTML = renderSafeMarkdown(combinedPlan);
+      document.getElementById('team-walkthrough-viewer').innerHTML = renderSafeMarkdown(
+        teamArtifacts.walkthrough,
+        '병렬 빌드 및 통합 검증 완료 후 생성됩니다.'
+      );
+    }
+  }
 
   const grid = document.getElementById('worktree-cards-grid');
   grid.innerHTML = tasks
     .map((t) => {
       const wt = worktrees[t.assigned_to] || {};
       const ho = handoffs[t.assigned_to] || {};
+      const blockedCount = ho.blocked_attempts_count ?? (ho.blocked_attempts?.length ?? 0);
+      const toolCallsCount = (ho.turn_trace || []).length;
       const tone = t.status === 'merged' || t.status === 'approved' ? 'success' : 'info';
       return `
         <div class="panel-box">
@@ -437,10 +730,10 @@ function renderWorktreesAndTasks() {
           </div>
           <div style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px;">
             <span class="badge" data-tone="info">LLM: ${escapeHtml(t.provider_used || 'auto')}</span>
-            <span class="badge" data-tone="${ho.blocked_attempts > 0 ? 'danger' : 'success'}">
-              Guard Blocked: ${ho.blocked_attempts ?? 0}
+            <span class="badge" data-tone="${blockedCount > 0 ? 'danger' : 'success'}">
+              Guard Blocked: ${blockedCount}
             </span>
-            <span class="badge">Tools: ${ho.tool_calls_count ?? 0} calls</span>
+            <span class="badge">Tools: ${toolCallsCount} calls</span>
           </div>
         </div>
       `;
@@ -460,16 +753,15 @@ function renderWorktreesAndTasks() {
           r.fallback_triggered ? ` [FALLBACK: ${r.fallback_reason}]` : ''
         }`
     );
-    const daPreview = state.dashboard.deepagents_preview || {};
     const headerBlock = [
-      `=== LangChain DeepAgents Harness Bridge ===`,
-      `Harness     : ${daPreview.harness || 'deepagents'}`,
-      `Middlewares : ${(daPreview.middlewares || []).join(', ')}`,
-      `Skills      : ${(daPreview.skills_loaded || []).join(', ')}`,
-      `Active Route: ${daPreview.provider_id}:${daPreview.model} (${daPreview.base_url})`,
+      `=== Unified Agent Engine ===`,
+      `Engine       : langchain-ai/deepagents v0.7`,
+      `LLM Status   : ${rotator.status_banner || ''}`,
+      `Middlewares  : TodoListMiddleware, ArtifactWorkflowMiddleware, RubricMiddleware, PytestGateMiddleware, PlanGateMiddleware`,
+      `Subagents    : repo-explorer (read-only), code-reviewer (read-only)`,
       ``,
-      `=== Recent Provider Rotations ===`,
-      ...rotLines,
+      `=== Recent Provider Selections ===`,
+      ...(rotLines.length ? rotLines : ['(no agent invocations yet)']),
     ].join('\n');
     document.getElementById('rotation-log-viewer').textContent = headerBlock;
   }
@@ -1058,6 +1350,69 @@ function renderCodeModeOutput() {
   }
 }
 
+async function runCodeModeAgent() {
+  const instruction = (document.getElementById('codemode-agent-instruction')?.value || '').trim();
+  const mode = document.getElementById('codemode-agent-mode')?.value || 'repl';
+  const badge = document.getElementById('codemode-agent-status-badge');
+  const runBtn = document.getElementById('run-codemode-agent-btn');
+  const outWrap = document.getElementById('codemode-agent-output');
+
+  if (!instruction) {
+    setBannerError('codemode-agent-error-banner', '자연어 지시문을 입력해 주세요.');
+    return;
+  }
+
+  setBannerError('codemode-agent-error-banner', '');
+  if (runBtn) runBtn.disabled = true;
+  if (badge) {
+    badge.textContent = `Running DeepAgent (${mode})...`;
+    badge.setAttribute('data-tone', 'info');
+  }
+
+  try {
+    const resp = await apiFetch(
+      '/api/code-mode/agent',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          instruction,
+          mode,
+          scenario_id: state.selectedCodeModeScenarioId,
+          reset_sandbox: true,
+        }),
+      },
+      90000
+    );
+    state.lastCodeModeAgentResponse = resp;
+    const agentRes = resp.result || {};
+    const cmp = resp.comparison || {};
+    if (outWrap) outWrap.style.display = 'flex';
+    if (badge) {
+      badge.textContent = `${String(agentRes.status || 'completed').toUpperCase()} · ${mode} (${cmp.llm_turns ?? 0} turns)`;
+      badge.setAttribute('data-tone', agentRes.passed ? 'success' : 'danger');
+    }
+    document.getElementById('codemode-agent-meta').innerHTML = `
+      <span class="badge" data-tone="core">mode: ${escapeHtml(mode)}</span>
+      <span class="badge" data-tone="success">LLM turns: ${cmp.llm_turns ?? 0}</span>
+      <span class="badge" data-tone="info">tool calls: ${cmp.tool_calls_count ?? 0} (inner REPL: ${cmp.inner_repl_tool_calls ?? 0})</span>
+      <span class="badge" data-tone="${(cmp.blocked_attempts_count ?? 0) > 0 ? 'danger' : 'success'}">blocked: ${cmp.blocked_attempts_count ?? 0}</span>
+      <span class="badge">LLM: ${escapeHtml(agentRes.provider_used || 'auto')}</span>
+    `;
+    document.getElementById('codemode-agent-summary').textContent = agentRes.summary || '';
+    document.getElementById('codemode-agent-trace').innerHTML = renderTurnTraceList(
+      agentRes.turn_trace || []
+    );
+  } catch (err) {
+    setBannerError('codemode-agent-error-banner', `에이전트 실행 실패: ${err.message}`);
+    if (badge) {
+      badge.textContent = 'AGENT ERROR';
+      badge.setAttribute('data-tone', 'danger');
+    }
+  } finally {
+    if (runBtn) runBtn.disabled = false;
+  }
+}
+
 /* ============================================================================
  * Initialization & Event Wiring
  * ============================================================================ */
@@ -1157,6 +1512,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   document.getElementById('run-build-task-btn')?.addEventListener('click', () => runBuildTask());
+  document.getElementById('approve-plan-proceed-btn')?.addEventListener('click', () =>
+    approveBuildPlan(true)
+  );
+  document.getElementById('approve-plan-revise-btn')?.addEventListener('click', () =>
+    approveBuildPlan(false)
+  );
   document.getElementById('tab2-quick-build-btn')?.addEventListener('click', () =>
     runBuildTask({ preset: 'project_map_app', instruction: BUILD_PRESETS.project_map_app.instruction })
   );
@@ -1193,6 +1554,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Code Mode Lab controls & Ctrl+O shortcut
   document.getElementById('run-codemode-btn')?.addEventListener('click', () => runCodeModeLab());
+  document.getElementById('run-codemode-agent-btn')?.addEventListener('click', () =>
+    runCodeModeAgent()
+  );
   document.getElementById('toggle-ctrlo-btn')?.addEventListener('click', () => toggleCtrlOTranscript());
   document.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'o') {
@@ -1251,11 +1615,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Native <dialog> modal controls
   const modal = document.getElementById('provider-modal');
   document.getElementById('open-provider-modal-btn')?.addEventListener('click', () => modal?.showModal());
+  document.getElementById('banner-open-provider-btn')?.addEventListener('click', () => modal?.showModal());
   document.getElementById('close-provider-modal-btn')?.addEventListener('click', () => modal?.close());
 
   document.querySelectorAll('.test-provider-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
-      const pid = btn.getAttribute('data-provider') || 'mock';
+      const pid = btn.getAttribute('data-provider') || 'gemini';
       const fb = document.getElementById('provider-test-feedback');
       btn.disabled = true;
       try {
@@ -1346,12 +1711,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     runBadge.setAttribute('data-tone', 'info');
     try {
       const goal = document.getElementById('workflow-goal-input').value;
-      const engineMode = document.getElementById('engine-select').value;
       const dash = await apiFetch(
         '/api/workflow/run',
         {
           method: 'POST',
-          body: JSON.stringify({ goal, engine_mode: engineMode }),
+          body: JSON.stringify({ goal }),
         },
         90000
       );

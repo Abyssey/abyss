@@ -43,13 +43,14 @@ def test_web_server_endpoints() -> None:
         assert ("allow-" + "same-origin") not in js_text
         assert "서비스 상태를 한눈에 보는 점검 대시보드 웹페이지를 만들어줘" in js_text
 
-        # 2. State endpoint (includes status, merged_branches, internal_remote)
+        # 2. State endpoint (includes engine, status, merged_branches, internal_remote)
         res_state = client.get("/api/state")
         assert res_state.status_code == 200
         state_data = res_state.json()
+        assert state_data["engine"] == "langchain-ai/deepagents"
         assert "worktrees" in state_data
         assert "rotator" in state_data
-        assert "deepagents_preview" in state_data
+        assert "mock" not in state_data["rotator"]["providers"]
         assert "status" in state_data
         assert "merged_branches" in state_data
         assert "internal_remote" in state_data
@@ -82,17 +83,17 @@ def test_web_server_endpoints() -> None:
         ]
         assert presets_data["build_presets"][0]["id"] == "project_map_app"
 
-        # 5. Provider rotation config & test
+        # 5. Provider rotation config & test (live providers only, no mock)
         res_rot = client.post(
             "/api/providers/config",
-            json={"strategy": "role_based", "active_single_provider": "mock"},
+            json={"strategy": "role_based", "active_single_provider": "gemini"},
         )
         assert res_rot.status_code == 200
         assert res_rot.json()["rotator"]["strategy"] == "role_based"
 
-        res_test_prov = client.post("/api/providers/test/mock")
+        res_test_prov = client.post("/api/providers/test/gemini")
         assert res_test_prov.status_code == 200
-        assert res_test_prov.json()["ok"] is True
+        assert res_test_prov.json()["provider_id"] == "gemini"
 
         # 6. Code Mode scenarios & live REPL execution (Act 2-C ok + Act 3 refused)
         res_cm_scenarios = client.get("/api/code-mode/scenarios")
@@ -200,6 +201,17 @@ def test_frontend_edge_cases_custom_chip_preview_reset_and_beginner_copy() -> No
 
     assert 'data-build-preset="custom"' in html_text
     assert "직접 입력 (custom)" in html_text
+    assert "langchain-ai/deepagents v0.7" in html_text
+    assert "⛔ LLM CONFIG REQUIRED" in html_text
+    assert "implementation_plan.md" in html_text
+    assert "walkthrough.md" in html_text
+    assert 'id="approve-plan-proceed-btn"' in html_text
+    assert 'id="codemode-agent-mode"' in html_text
+    assert 'value="mock"' not in html_text
+    assert "engine-select" not in html_text
+    assert "/plan/approve" in js_text
+    assert "/api/code-mode/agent" in js_text
+    assert "renderSafeMarkdown" in js_text
     assert "custom:" in js_text
     assert "iframe.removeAttribute('src')" in js_text
     assert "iframe.removeAttribute('srcdoc')" in js_text

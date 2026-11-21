@@ -17,13 +17,9 @@ dependencies = [
     "httpx>=0.27.2",
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
-]
-
-[project.optional-dependencies]
-deepagents = [
-    "deepagents>=0.7.0",
-    "langchain-openai>=0.3.0",
-    "langchain-google-genai>=2.0.0",
+    "deepagents>=0.7.39,<0.8",
+    "langchain-openai>=1.0",
+    "langchain-google-genai>=4.4.3",
 ]
 
 [tool.setuptools.packages.find]
@@ -38,3 +34,6 @@ pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+markers = [
+    "live_llm: Live LLM end-to-end verification tests (requires GEMINI_API_KEY and live network)",
+]

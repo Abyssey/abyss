@@ -12,7 +12,6 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 class WorkflowTriggerPayload(BaseModel):
     goal: str = "Build RepoOnboard: Local & Internal Git Codebase Onboarding Service"
-    engine_mode: str = "agent_runtime"
 
 
 class BuildTaskRequest(BaseModel):
@@ -27,6 +26,12 @@ class BuildTaskRequest(BaseModel):
     base_branch: str = "main"
     use_code_mode: bool = False
     push_to_remote: bool = True
+    plan_review: Literal["request_review", "always_proceed"] | None = None
+
+
+class PlanApproveRequest(BaseModel):
+    comments: str | list[str] | None = None
+    proceed: bool = True
 
 
 class BuildTestResult(BaseModel):
@@ -38,7 +43,7 @@ class BuildTestResult(BaseModel):
 class BuildTaskResponse(BaseModel):
     task_id: str
     preset: str
-    status: Literal["completed", "failed"]
+    status: Literal["completed", "awaiting_plan_review", "failed"]
     repo_name: str
     source_type: str
     branch_name: str
@@ -55,6 +60,13 @@ class BuildTaskResponse(BaseModel):
     preview_file: str | None = None
     provider_used: str
     summary: str
+    mr_description: str = ""
+    artifacts: dict[str, str] = Field(default_factory=dict)
+    todos: list[dict[str, str]] = Field(default_factory=list)
+    turn_trace: list[dict[str, Any]] = Field(default_factory=list)
+    subagent_calls: list[dict[str, Any]] = Field(default_factory=list)
+    pytest_gate_runs: list[dict[str, Any]] = Field(default_factory=list)
+    rubric_evaluations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ReviewTaskRequest(BaseModel):
@@ -78,9 +90,19 @@ class ReviewTaskRequest(BaseModel):
 class ReviewFindingDTO(BaseModel):
     severity: Literal["high", "medium", "low"]
     file: str
-    line: int
+    line: int = 1
     comment: str
-    suggestion: str
+    suggestion: str = ""
+
+
+class ReviewFindings(BaseModel):
+    """Structured output schema produced by the read-only `deepagents` Reviewer."""
+
+    summary: str = Field(default="", description="Concise Korean summary of the code review.")
+    findings: list[ReviewFindingDTO] = Field(
+        default_factory=list,
+        description="Concrete file:line defects, security leaks, or missing test findings.",
+    )
 
 
 class DiffStatsDTO(BaseModel):

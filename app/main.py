@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.config import AppSettings, load_settings
 from app.core.container import build_container
+from app.core.llm.provider_rotator import LLM_CONFIG_REQUIRED_BANNER, LLMConfigurationError
 from app.core.llm.router import router as llm_router
 from app.domains.execution.router import router as execution_router
 from app.domains.onboarding.router import router as onboarding_router
@@ -39,14 +40,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
-        # 1. Ensure demo workspace has initial merged RepoOnboard files on first boot
-        if not (container.demo_workspace / "repo_onboard" / "service.py").exists():
-            await container.coordinator.execute_full_workflow(
-                "Build RepoOnboard: Local & Internal Git Codebase Onboarding Service"
-            )
-        # 2. Always guarantee offline bare remote fixture (`internal_origin.git`) is ready
+        # 1. Guarantee offline bare remote fixture (`internal_origin.git`) is ready without LLM calls
         container.coordinator.ensure_internal_bare_remote()
-        # 3. Always reset isolated Code Mode REPL sandbox cleanly
+        # 2. Reset isolated Code Mode REPL sandbox cleanly
         container.code_mode_service.reset_sandbox()
         yield
 
@@ -57,6 +53,19 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     )
     application.state.container = container
     application.mount("/static", StaticFiles(directory=str(effective_settings.static_dir)), name="static")
+
+    @application.exception_handler(LLMConfigurationError)
+    async def llm_config_required(_request: Request, exc: LLMConfigurationError) -> JSONResponse:
+        # Fail-Fast: LLM 자격증명이 없으면 가짜 결과 대신 503으로 즉시 알립니다.
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "llm_config_required",
+                "error": LLM_CONFIG_REQUIRED_BANNER,
+                "detail": str(exc),
+                "hint": "Set GEMINI_API_KEY (or QWEN_*/OPENAI_*) in .env, or configure a provider at /api/llm.",
+            },
+        )
 
     @application.get("/healthz", tags=["Pod Readiness & Health"])
     async def healthz() -> dict[str, str]:

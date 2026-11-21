@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 
 class CodeModeRunRequest(BaseModel):
@@ -16,6 +16,24 @@ class CodeModeRunRequest(BaseModel):
     reset_sandbox: bool = True
     simulate_slow_hook: bool = False
     hook_on_failure: Literal["block", "continue"] = "block"
+
+
+class CodeModeAgentRequest(BaseModel):
+    instruction: str = Field(min_length=1, description="Natural-language coding instruction for the sandbox agent.")
+    mode: Literal["direct", "repl"] = "repl"
+    scenario_id: str | None = None
+    reset_sandbox: bool = True
+    completion_cmd: str | None = None
+    rubric: str | None = None
+
+    @field_validator("instruction")
+    @classmethod
+    def _strip_non_empty(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            msg = "instruction must not be empty or whitespace."
+            raise ValueError(msg)
+        return cleaned
 
 
 class CodeModeComparisonMetrics(BaseModel):

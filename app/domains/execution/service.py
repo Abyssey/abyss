@@ -5,11 +5,14 @@ Use-Case Service for the Code Mode (`REPL`) & Guardrails Interactive Lab (Act 2 
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 from app.domains.execution.code_mode import CodeModeExecutor, HookSpec
+from app.domains.execution.deepagent_backend import GuardedWorktreeBackend
+from app.domains.execution.runtime import DeepAgentRuntime
 from app.domains.guardrails.permissions import PermissionRules
 
 CODE_MODE_SCENARIOS: list[dict[str, Any]] = [
@@ -151,10 +154,25 @@ class CodeModeLabService:
         sandbox_root: Path,
         main_checkout_root: Path,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
+        model_factory: Callable[[str, str], Any] | None = None,
     ) -> None:
         self.sandbox_root = Path(sandbox_root).resolve()
         self.main_checkout_root = Path(main_checkout_root).resolve()
         self.event_callback = event_callback
+        self.model_factory = model_factory
+
+    def _resolve_model(self, agent_id: str, role: str) -> tuple[Any, str, list[Any]]:
+        if self.model_factory is None:
+            msg = "CodeModeLabService has no `model_factory` configured for live agent execution."
+            raise RuntimeError(msg)
+        selection = self.model_factory(agent_id, role)
+        if hasattr(selection, "model") and hasattr(selection, "label"):
+            mw_fn = getattr(selection, "middleware", None)
+            extra_mw = list(mw_fn()) if callable(mw_fn) else []
+            return selection.model, str(selection.label), extra_mw
+        if isinstance(selection, tuple) and len(selection) == 2:
+            return selection[0], str(selection[1]), []
+        return selection, getattr(selection, "model_name", type(selection).__name__), []
 
     def reset_sandbox(self) -> Path:
         return reset_code_mode_sandbox(self.sandbox_root)
@@ -229,5 +247,105 @@ class CodeModeLabService:
                 "raw_intermediate_chars": raw_tool_chars,
                 "returned_to_model_chars": returned_chars,
                 "context_saved_pct": saved_pct,
+            },
+        }
+
+    async def run_agent(
+        self,
+        instruction: str,
+        *,
+        mode: Literal["direct", "repl"] = "repl",
+        scenario_id: str | None = None,
+        reset_sandbox: bool = True,
+        completion_cmd: str | None = None,
+        rubric: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Execute a natural-language coding task inside the isolated Code Mode sandbox
+        using `DeepAgentRuntime` in either `"direct"` (built-in tools) or `"repl"`
+        (`run_python` batch Code Mode) dispatch mode.
+        """
+        agent_id = f"code-mode-{mode}"
+        model, provider_label, fallback_mw = self._resolve_model(agent_id, "builder")
+
+        if reset_sandbox or not self.sandbox_root.exists():
+            self.reset_sandbox()
+
+        scenario_note = ""
+        if scenario_id:
+            matched = next((s for s in CODE_MODE_SCENARIOS if s["id"] == scenario_id), None)
+            if matched is not None:
+                scenario_note = f"\nScenario context ({matched['id']}): {matched['title']}"
+
+        backend = GuardedWorktreeBackend(
+            worktree_root=self.sandbox_root,
+            main_checkout_root=self.main_checkout_root,
+            on_block=(
+                (
+                    lambda attempt: self.event_callback(
+                        {
+                            "agent_id": agent_id,
+                            "event_type": "isolation_blocked",
+                            "operation": attempt.operation,
+                            "target": attempt.target,
+                            "check_name": attempt.check_name,
+                            "reason": attempt.reason,
+                        }
+                    )
+                )
+                if self.event_callback is not None
+                else None
+            ),
+        )
+        code_mode_exec = (
+            CodeModeExecutor(
+                worktree_root=self.sandbox_root,
+                main_checkout_root=self.main_checkout_root,
+                permissions=PermissionRules.default(),
+                event_callback=self.event_callback,
+                agent_id=agent_id,
+            )
+            if mode == "repl"
+            else None
+        )
+
+        runtime = DeepAgentRuntime(
+            model=model,
+            backend=backend,
+            mode=mode,
+            workflow="fast",
+            code_mode=code_mode_exec,
+            completion_cmd=completion_cmd,
+            rubric=rubric,
+            extra_middleware=fallback_mw,
+            subagents=False,
+            agent_id=agent_id,
+            provider_label=provider_label,
+            event_callback=self.event_callback,
+        )
+
+        system_prompt = (
+            "You are an autonomous coding agent operating inside an isolated Code Mode sandbox "
+            "(containing `src/retry_policy.py`, `src/test_retry.py`, and `docs/*.md`). "
+            "Respect all worktree isolation and permission guardrails."
+        )
+        task_prompt = f"{instruction}{scenario_note}"
+
+        agent_res = await asyncio.to_thread(runtime.run, system_prompt, task_prompt)
+        inner_repl_calls = (
+            len(code_mode_exec.last_result.tool_calls)
+            if code_mode_exec is not None and code_mode_exec.last_result is not None
+            else 0
+        )
+        return {
+            "result": agent_res.to_dict(),
+            "comparison": {
+                "mode": mode,
+                "scenario_id": scenario_id,
+                "llm_turns": agent_res.llm_turns,
+                "tool_calls_count": len(agent_res.turn_trace),
+                "inner_repl_tool_calls": inner_repl_calls,
+                "blocked_attempts_count": len(agent_res.blocked_attempts),
+                "files_touched": list(agent_res.files_touched),
             },
         }

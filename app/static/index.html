@@ -42,20 +42,19 @@
       <div class="control-pill">
         <label for="single-provider-select">Primary Provider</label>
         <select id="single-provider-select" aria-label="Select Primary LLM Provider">
-          <option value="qwen">Qwen 3.8 Flash (Internal)</option>
           <option value="gemini">Google Gemini 2.5 Flash</option>
+          <option value="qwen">Qwen 3.8 Flash (Internal)</option>
           <option value="openai">OpenAI GPT-4o-mini</option>
-          <option value="mock">Deterministic Simulator (Offline)</option>
         </select>
       </div>
 
-      <div class="control-pill">
-        <label for="engine-select">Execution Engine</label>
-        <select id="engine-select" aria-label="Select Execution Engine">
-          <option value="agent_runtime">Focus Domain AgentRuntime (Python)</option>
-          <option value="deepagents">LangChain DeepAgents Bridge</option>
-        </select>
-      </div>
+      <span id="engine-badge" class="badge" data-tone="core" title="Single Unified Agent Engine">
+        langchain-ai/deepagents v0.7
+      </span>
+
+      <span id="llm-status-badge" class="badge" data-tone="danger" role="status">
+        ⛔ LLM CONFIG REQUIRED
+      </span>
 
       <button type="button" id="open-provider-modal-btn" class="btn">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -88,6 +87,14 @@
       <span>코드 리뷰 (MR) · "방금 작업한 브랜치 코드에 보안 문제나 버그가 없는지 리뷰해줘"</span>
     </button>
   </nav>
+
+  <div id="llm-config-warning-banner" class="llm-warning-strip" role="alert" data-visible="false">
+    <div>
+      <strong>⛔ LLM CONFIG REQUIRED</strong> — 에이전트 빌드(Act 2)·리뷰(Act 4)·팀 실행·Code Mode 에이전트를 사용하려면 <code>.env</code>에 <code>GEMINI_API_KEY</code>(또는 Qwen/OpenAI 키)를 설정하거나 우측 버튼에서 API Key를 입력하세요.
+      <span style="color: var(--color-text-muted);">(Act 1 구조 분석과 Act 3 오프라인 REPL 가드레일 시나리오는 키 없이도 바로 실행됩니다.)</span>
+    </div>
+    <button type="button" id="banner-open-provider-btn" class="btn btn-core">API Key 입력하기</button>
+  </div>
 
   <!-- ======================================================================
        Main Two-Column Workspace
@@ -151,6 +158,14 @@
             <textarea id="build-instruction-input" aria-label="Build Task Instruction">이 프로젝트 지도를 클릭해서 볼 수 있는 웹페이지를 만들어줘</textarea>
           </div>
 
+          <div class="field-group">
+            <label for="build-plan-review-select">Plan Review 정책 (Antigravity Artifact Gate)</label>
+            <select id="build-plan-review-select" class="text-input" aria-label="Plan Review Policy">
+              <option value="request_review" selected>request_review (기본 · 계획 작성 후 Proceed 승인 대기)</option>
+              <option value="always_proceed">always_proceed (계획 작성 후 즉시 코딩 진행)</option>
+            </select>
+          </div>
+
           <label class="checkbox-row">
             <input type="checkbox" id="build-push-remote-cb" checked />
             <span>Push branch to remote (<code>origin</code>)</span>
@@ -158,7 +173,7 @@
 
           <label class="checkbox-row">
             <input type="checkbox" id="build-codemode-cb" />
-            <span>Code Mode (<code>REPL</code>) 1-Step 모드로 빌드 실행</span>
+            <span>Code Mode (<code>REPL</code> / <code>run_python</code>) 모드로 빌드 실행</span>
           </label>
 
           <div id="build-error-banner" class="error-banner" role="alert" data-visible="false"></div>
@@ -351,9 +366,9 @@
                   <td><strong>순수 Python 표준 라이브러리 전용 (외부 의존성 0개)</strong>: <code>isolation_policy.py</code>(4-Check Worktree 경로·CWD·Git Redirect·동적 구문 검증) + <code>permissions.py</code>(따옴표·리다이렉션 보존 복합 명령 세그먼트 분리 및 <code>deny &gt; ask &gt; allow</code> 게이트)</td>
                 </tr>
                 <tr>
-                  <td><strong>2. ★ Focus Domain #2<br>Claude Code Kick: Code Mode <code>REPL</code><br>(<code>domains/execution/</code>)</strong></td>
-                  <td>도구 1개마다 LLM 왕복을 반복하는 Direct Tool Calling은 지연과 중간 stdout 컨텍스트 오염을 유발 (공식 Claude Code REPL은 Anthropic 직결 API 전용)</td>
-                  <td><strong><code>code_mode.py</code> + <code>runtime.py</code></strong>: 단일 <code>REPL</code> 턴으로 검색·편집·병렬 읽기(<code>gather</code>)·테스트를 묶어 실행하고 마지막 표현식만 반환. STEP 0 정적 AST 검토 + STEP 2 호출별 권한·격리 검증으로 사내 <strong>Qwen 3.8 Flash</strong>에서도 안전하게 구동</td>
+                  <td><strong>2. ★ Focus Domain #2<br>DeepAgents + Code Mode <code>REPL</code><br>(<code>domains/execution/</code>)</strong></td>
+                  <td>도구 1개마다 LLM 왕복을 반복하는 Direct Tool Calling은 지연과 중간 stdout 컨텍스트 오염을 유발</td>
+                  <td><strong><code>runtime.py</code>(<code>DeepAgentRuntime</code>) + <code>deepagent_backend.py</code> + <code>code_mode.py</code></strong>: <code>langchain-ai/deepagents v0.7</code> 단일 엔진 위에서 <code>GuardedWorktreeBackend</code>·<code>PytestGateMiddleware</code>·<code>RubricMiddleware</code>와 단일 <code>run_python</code>(<code>REPL</code>) 배치를 결합</td>
                 </tr>
                 <tr>
                   <td><strong>3. 격리 빌드 + 라이브 프리뷰 &amp; 독립 MR 리뷰<br>(<code>domains/workflow/</code>)</strong></td>
@@ -361,9 +376,9 @@
                   <td><strong><code>task_service.py</code> · <code>evaluator.py</code> · <code>coordinator.py</code></strong>: 격리 Git Worktree(<code>agent/task-*</code>)에서 AST 스캔 기반 프로젝트 지도 웹앱·점검 대시보드를 생성·테스트하고 <code>sandbox="allow-scripts"</code> 라이브 프리뷰 제공. 읽기 전용 독립 Reviewer가 <code>file:line</code> 결함 지적 및 100점 머지 게이트 판정</td>
                 </tr>
                 <tr>
-                  <td><strong>4. 컨텍스트 수명주기 전략<br>(Auto-Compaction vs Optional Context Reset)</strong></td>
-                  <td>Claude Code CLI의 기본 동작은 <strong>Auto-Compaction</strong>(<code>/compact</code>, <code>CLAUDE.md</code>)이며, 작업 규모·에이전트 인계 시 <strong>Context Reset</strong>(<code>/clear</code>) + 구조화 핸드오프를 선택적으로 사용</td>
-                  <td><strong><code>runtime.py</code> (<code>context_strategy</code> 옵션)</strong>: 기본 Auto-Compaction(<code>"compaction"</code>)과 장기·교차 에이전트 인계용 Context Reset + <code>HandoffArtifact</code>(<code>"reset_handoff"</code>)를 작업 성격에 따라 명시적으로 선택 가능</td>
+                  <td><strong>4. Antigravity 3단계 산출물 &amp; 컨텍스트 관리<br>(<code>artifact_workflow.py</code>)</strong></td>
+                  <td>계획 없는 즉흥 파일 수정과 검증 결과 조작을 막기 위해 <strong>PLANNING → EXECUTION → VERIFICATION</strong> 단계 분리 및 서브에이전트 컨텍스트 격리 필수</td>
+                  <td><strong><code>ArtifactWorkflowMiddleware</code> + <code>CompositeBackend</code></strong>: <code>/artifacts/implementation_plan.md</code>(기본 <code>request_review</code> 승인 게이트) → <code>/artifacts/task.md</code>(<code>write_todos</code> 동기화) → <code>pytest</code> 실출력 스탬프가 찍힌 <code>/artifacts/walkthrough.md</code> 자동 생성</td>
                 </tr>
                 <tr>
                   <td><strong>5. 로컬 폴더 우선 &amp; 사내 GitLab Pod 대응<br>(<code>domains/onboarding/</code> · <code>core/</code>)</strong></td>
@@ -443,8 +458,56 @@
             아직 실행된 빌드 작업이 없습니다. <strong>"★ 지금 바로 프로젝트 지도 웹앱 빌드"</strong>를 누르면 격리 브랜치(<code>agent/task-*</code>)에서 실제 Python AST 스캐너와 클릭 가능한 프로젝트 지도 웹페이지(<code>project_map/index.html</code>)를 만들고 <code>pytest</code> 검증 후 아래에 라이브 프리뷰를 띄웁니다.
           </div>
 
-          <div id="build-result-content" class="build-result-grid" style="display: none;">
-            <!-- Left: Run Metadata, Changed Files, Git Diff & Pytest -->
+          <div id="build-result-content" style="display: none; flex-direction: column; gap: 16px;">
+            <!-- ★ Antigravity 3-Artifact Cards + Plan Proceed Gate -->
+            <div id="build-artifacts-panel" class="artifacts-section">
+              <div id="plan-approval-box" class="plan-approval-bar" style="display: none;">
+                <div style="display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 240px;">
+                  <strong>⏸ Awaiting Plan Review (<code>request_review</code>)</strong>
+                  <span style="font-size: 12px; color: var(--color-text-secondary);">아래 <code>implementation_plan.md</code>를 검토한 뒤 <strong>Proceed</strong>로 코딩을 시작하거나 코멘트를 남겨 계획을 수정하세요.</span>
+                  <input
+                    type="text"
+                    id="plan-review-comment-input"
+                    class="text-input"
+                    placeholder="선택 코멘트 입력 (예: 모든 심볼 이름에 HTML 이스케이프를 적용해줘)"
+                    aria-label="Plan Review Inline Comment"
+                  />
+                </div>
+                <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+                  <button type="button" id="approve-plan-revise-btn" class="btn">코멘트로 계획 수정</button>
+                  <button type="button" id="approve-plan-proceed-btn" class="btn btn-primary">✓ Proceed (실행 시작)</button>
+                </div>
+              </div>
+
+              <div class="grid-3">
+                <div class="artifact-card">
+                  <div class="artifact-card-header">
+                    <span>1. <code>implementation_plan.md</code></span>
+                    <span class="badge" data-tone="info">PLANNING</span>
+                  </div>
+                  <div id="artifact-plan-viewer" class="markdown-body">아직 생성되지 않았습니다.</div>
+                </div>
+
+                <div class="artifact-card">
+                  <div class="artifact-card-header">
+                    <span>2. <code>task.md</code> · TodoList</span>
+                    <span class="badge" data-tone="core">EXECUTION</span>
+                  </div>
+                  <div id="artifact-task-viewer" class="markdown-body">아직 생성되지 않았습니다.</div>
+                </div>
+
+                <div class="artifact-card">
+                  <div class="artifact-card-header">
+                    <span>3. <code>walkthrough.md</code></span>
+                    <span class="badge" data-tone="success">VERIFICATION</span>
+                  </div>
+                  <div id="artifact-walkthrough-viewer" class="markdown-body">검증 완료 후 생성됩니다.</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="build-result-grid">
+            <!-- Left: Run Metadata, Changed Files, DeepAgent Telemetry, Git Diff & Pytest -->
             <div style="display: flex; flex-direction: column; gap: 10px;">
               <div id="build-result-meta" style="display: flex; flex-wrap: wrap; gap: 6px;"></div>
               <div id="build-result-summary" style="font-size: 12.5px; color: var(--color-text-secondary);"></div>
@@ -452,6 +515,16 @@
               <div>
                 <div style="font-size: 11.5px; font-weight: 600; color: var(--color-text-muted); margin-bottom: 5px;">생성·변경된 파일 (Changed Files)</div>
                 <div id="build-changed-files" class="file-pill-list"></div>
+              </div>
+
+              <div>
+                <div style="font-size: 11.5px; font-weight: 600; color: var(--color-text-muted); margin-bottom: 5px;">Completion Gates (<code>PytestGateMiddleware</code> + <code>RubricMiddleware</code>) &amp; Subagents</div>
+                <div id="build-gates-subagents-viewer" class="trace-list"></div>
+              </div>
+
+              <div>
+                <div style="font-size: 11.5px; font-weight: 600; color: var(--color-text-muted); margin-bottom: 5px;">DeepAgent Timeline (<code>Turn N: Tool -&gt; Observation</code>)</div>
+                <div id="build-turn-trace-viewer" class="trace-list"></div>
               </div>
 
               <div>
@@ -487,6 +560,31 @@
                 title="Built App Live Preview"
                 class="preview-iframe"
               ></iframe>
+            </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Team Plan / Walkthrough Artifacts (3-Worktree Team Run) -->
+        <div id="team-artifacts-panel" class="panel-box" style="display: none;">
+          <div class="panel-title">
+            <span>3-Worktree Team Artifacts (Lead <code>TeamPlan</code> &amp; Merged <code>walkthrough.md</code>)</span>
+            <span class="badge" data-tone="core">langchain-ai/deepagents</span>
+          </div>
+          <div class="grid-2">
+            <div class="artifact-card">
+              <div class="artifact-card-header">
+                <span>Lead <code>implementation_plan.md</code> &amp; Todos</span>
+                <span class="badge" data-tone="info">Lead</span>
+              </div>
+              <div id="team-plan-viewer" class="markdown-body"></div>
+            </div>
+            <div class="artifact-card">
+              <div class="artifact-card-header">
+                <span>Synthesized Team <code>walkthrough.md</code></span>
+                <span class="badge" data-tone="success">Merged</span>
+              </div>
+              <div id="team-walkthrough-viewer" class="markdown-body"></div>
             </div>
           </div>
         </div>
@@ -735,6 +833,37 @@
           <span class="badge">Ctrl+O: Transcript Code 토글</span>
         </div>
 
+        <!-- ★ Natural-Language Code Mode DeepAgent Runner (POST /api/code-mode/agent) -->
+        <div id="codemode-agent-panel" class="panel-box">
+          <div class="panel-title" style="flex-wrap: wrap; gap: 8px;">
+            <span>Natural-Language Code Mode Agent (<code>POST /api/code-mode/agent</code> · <code>direct</code> vs <code>repl</code>)</span>
+            <span id="codemode-agent-status-badge" class="badge" data-tone="core">langchain-ai/deepagents v0.7</span>
+          </div>
+          <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+            <input
+              type="text"
+              id="codemode-agent-instruction"
+              class="text-input"
+              style="flex: 1; min-width: 260px;"
+              value="src/retry_policy.py의 maxAttempts를 3에서 5로 올리고 pytest로 검증해줘"
+              aria-label="Code Mode Agent Natural Language Instruction"
+            />
+            <select id="codemode-agent-mode" class="role-select" style="padding: 6px 10px; font-size: 12.5px;" aria-label="Code Mode Agent Dispatch Mode">
+              <option value="repl" selected>repl (run_python 배치 턴)</option>
+              <option value="direct">direct (개별 파일/셸 도구 턴)</option>
+            </select>
+            <button type="button" id="run-codemode-agent-btn" class="btn btn-primary">
+              ▶ Run DeepAgent
+            </button>
+          </div>
+          <div id="codemode-agent-error-banner" class="error-banner" role="alert" data-visible="false"></div>
+          <div id="codemode-agent-output" style="display: none; flex-direction: column; gap: 8px;">
+            <div id="codemode-agent-meta" style="display: flex; flex-wrap: wrap; gap: 6px;"></div>
+            <div id="codemode-agent-summary" style="font-size: 12.5px; color: var(--color-text-secondary);"></div>
+            <div id="codemode-agent-trace" class="trace-list"></div>
+          </div>
+        </div>
+
         <!-- Scenario Preset Bar -->
         <div class="panel-box">
           <div class="panel-title" style="flex-wrap: wrap; gap: 8px;">
@@ -860,7 +989,6 @@
               <option value="gemini">gemini</option>
               <option value="qwen">qwen (3.8-flash)</option>
               <option value="openai">openai</option>
-              <option value="mock">mock</option>
             </select>
           </label>
           <label>
@@ -869,7 +997,6 @@
               <option value="qwen">qwen (3.8-flash)</option>
               <option value="gemini">gemini</option>
               <option value="openai">openai</option>
-              <option value="mock">mock</option>
             </select>
           </label>
           <label>
@@ -878,7 +1005,6 @@
               <option value="gemini">gemini</option>
               <option value="qwen">qwen (3.8-flash)</option>
               <option value="openai">openai</option>
-              <option value="mock">mock</option>
             </select>
           </label>
         </div>

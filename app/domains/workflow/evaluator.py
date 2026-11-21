@@ -665,3 +665,149 @@ class EvaluatorRubric:
             diff_stats=diff_stats,
             rubric_breakdown=rubric_breakdown,
         )
+
+    def merge_llm_findings(
+        self,
+        report: DiffReviewReport,
+        findings: list[dict[str, Any]],
+        *,
+        llm_summary: str = "",
+    ) -> DiffReviewReport:
+        """
+        Merge structured LLM reviewer findings (`[{severity, file, line, comment, suggestion}]`)
+        into a deterministic `DiffReviewReport` (pure stdlib: deduplicates and recomputes score
+        & `APPROVE` / `REQUEST_CHANGES` verdict).
+        """
+        merged: list[ReviewFindingItem] = list(report.findings)
+        seen_keys: set[tuple[str, int, str]] = {
+            (f.file.strip().lstrip("/"), max(1, int(f.line)), f.severity) for f in merged
+        }
+        seen_comments: set[tuple[str, int, str]] = {
+            (f.file.strip().lstrip("/"), max(1, int(f.line)), f.comment.strip().lower()[:48])
+            for f in merged
+        }
+
+        added_high = 0
+        added_medium = 0
+        added_low = 0
+
+        for raw in findings or []:
+            if not isinstance(raw, dict):
+                continue
+            raw_sev = str(raw.get("severity", "medium")).strip().lower()
+            severity: Literal["high", "medium", "low"] = (
+                raw_sev if raw_sev in ("high", "medium", "low") else "medium"  # type: ignore[assignment]
+            )
+            file_path = str(raw.get("file", "")).strip().lstrip("/") or (
+                report.diff_stats.files[0] if report.diff_stats.files else "unknown"
+            )
+            try:
+                line_no = max(1, int(raw.get("line", 1)))
+            except (TypeError, ValueError):
+                line_no = 1
+            comment = str(raw.get("comment", "")).strip()
+            suggestion = str(raw.get("suggestion", "")).strip() or "해당 라인의 로직과 예외 처리를 점검해 수정하세요."
+            if not comment:
+                continue
+
+            sev_key = (file_path, line_no, severity)
+            comment_key = (file_path, line_no, comment.lower()[:48])
+            if sev_key in seen_keys or comment_key in seen_comments:
+                continue
+            seen_keys.add(sev_key)
+            seen_comments.add(comment_key)
+
+            merged.append(
+                ReviewFindingItem(
+                    severity=severity,
+                    file=file_path,
+                    line=line_no,
+                    comment=comment,
+                    suggestion=suggestion,
+                )
+            )
+            if severity == "high":
+                added_high += 1
+            elif severity == "medium":
+                added_medium += 1
+            else:
+                added_low += 1
+
+        # Recompute rubric breakdown & total score incorporating newly added LLM findings
+        updated_breakdown: list[CriterionScore] = []
+        pytest_failed = False
+        for crit in report.rubric_breakdown:
+            if crit.name == "Automated Test Coverage & Execution":
+                if crit.score == 0 and not crit.passed:
+                    pytest_failed = True
+                updated_breakdown.append(CriterionScore(**crit.to_dict()))
+            elif crit.name == "Error Handling & Reliability" and added_high > 0:
+                new_score = max(0, crit.score - 20 * added_high)
+                updated_breakdown.append(
+                    CriterionScore(
+                        name=crit.name,
+                        score=new_score,
+                        max_score=crit.max_score,
+                        passed=new_score == crit.max_score and crit.passed,
+                        comment=(
+                            crit.comment
+                            if new_score == crit.score
+                            else f"심층 리뷰에서 심각(High) 결함 {added_high}건이 추가 탐지되었습니다."
+                        ),
+                    )
+                )
+            elif crit.name == "Diff Substance & Completeness" and (added_medium > 0 or added_low > 0):
+                penalty = 5 * added_medium + 2 * added_low
+                new_score = max(0, crit.score - penalty)
+                updated_breakdown.append(
+                    CriterionScore(
+                        name=crit.name,
+                        score=new_score,
+                        max_score=crit.max_score,
+                        passed=new_score >= 12 and crit.passed,
+                        comment=(
+                            crit.comment
+                            if penalty == 0
+                            else f"심층 리뷰 주의/권장 지적(Medium {added_medium}건, Low {added_low}건)이 반영되었습니다."
+                        ),
+                    )
+                )
+            else:
+                updated_breakdown.append(CriterionScore(**crit.to_dict()))
+
+        if updated_breakdown:
+            total_score = max(0, min(100, sum(c.score for c in updated_breakdown)))
+        else:
+            total_score = max(0, report.score - 20 * added_high - 5 * added_medium - 2 * added_low)
+
+        has_high = any(f.severity == "high" for f in merged)
+        has_diff = report.diff_stats.additions > 0 or report.diff_stats.files_changed > 0
+        decision: Literal["APPROVE", "REQUEST_CHANGES"] = (
+            "APPROVE"
+            if (not has_high and not pytest_failed and has_diff and total_score >= 80)
+            else "REQUEST_CHANGES"
+        )
+
+        high_cnt = sum(1 for f in merged if f.severity == "high")
+        med_cnt = sum(1 for f in merged if f.severity == "medium")
+        if decision == "APPROVE":
+            summary = (
+                f"승인(APPROVE · {total_score}/100): 정적 루브릭 및 독립 LLM 리뷰 통과 "
+                f"({report.diff_stats.files_changed}개 파일, 지적 {len(merged)}건)."
+            )
+        else:
+            summary = (
+                f"수정 요청(REQUEST_CHANGES · {total_score}/100): "
+                f"심각(High) {high_cnt}건, 주의(Medium) {med_cnt}건이 발견되었습니다."
+            )
+        if llm_summary.strip():
+            summary = f"{summary} {llm_summary.strip()}"
+
+        return DiffReviewReport(
+            decision=decision,
+            score=total_score,
+            summary=summary,
+            findings=merged,
+            diff_stats=DiffStatsSummary(**report.diff_stats.to_dict()),
+            rubric_breakdown=updated_breakdown,
+        )

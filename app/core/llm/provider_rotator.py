@@ -1,15 +1,12 @@
 """
 app/core/llm/provider_rotator.py
-Multi-Provider LLM Rotator (Qwen 3.8 Flash / Google Gemini / OpenAI / Mock) — Shared Kernel.
+Multi-Provider Live LLM Rotator & LangChain Chat-Model Factory (Qwen 3.8 Flash / Gemini / OpenAI).
 
-- 사내 Qwen 3.8 Flash 엔드포인트(vLLM / SGLang / QwenCloud OpenAI 호환 API),
-  Google Gemini API(OpenAI 호환 엔드포인트), OpenAI API, 그리고 오프라인/발표용
-  결정론적 Mock 프로바이더를 통합 관리합니다.
-- 웹 관제 UI에서 코드 수정이나 서버 재시작 없이 실시간으로:
-  1) 로테이션 전략 변경 (`role_based`, `round_robin`, `fallback`, `single`)
-  2) 각 프로바이더의 `base_url`, `api_key`, `model`, `enabled` 수정
-  3) 역할별(Lead / Builder / Worker / Reviewer) 배정 프로바이더 변경
-  을 수행할 수 있습니다.
+- Manages internal Qwen 3.8 Flash endpoints (vLLM / SGLang / QwenCloud OpenAI-compatible API),
+  Google Gemini (`ChatGoogleGenerativeAI`), and OpenAI (`ChatOpenAI`).
+- Zero mock/offline simulation fallback: when no enabled provider has valid credentials,
+  `build_chat_model` fails fast with `LLMConfigurationError` (mapped to HTTP 503
+  `⛔ LLM CONFIG REQUIRED`).
 """
 
 from __future__ import annotations
@@ -17,54 +14,82 @@ from __future__ import annotations
 import itertools
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
-from openai import OpenAI
+
+if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
 
 load_dotenv()
 
+LLM_CONFIG_REQUIRED_BANNER = "⛔ LLM CONFIG REQUIRED"
+CHAT_MODEL_TIMEOUT_S = 90.0
+CHAT_MODEL_MAX_RETRIES = 2
+
+
+class LLMConfigurationError(RuntimeError):
+    """활성화된 프로바이더 중 유효한 자격증명이 하나도 없을 때 발생합니다 (→ HTTP 503)."""
+
+    http_status_code: int = 503
+
+
+@dataclass
+class ChatModelSelection:
+    """`build_chat_model` 결과: 주 모델 + 장애 조치(Fallback) 모델 체인."""
+
+    model: BaseChatModel
+    label: str
+    fallbacks: list[BaseChatModel] = field(default_factory=list)
+    fallback_labels: list[str] = field(default_factory=list)
+
+    def middleware(self) -> list[Any]:
+        """deepagents/LangChain 에이전트용 `ModelFallbackMiddleware` (fallback이 없으면 빈 리스트)."""
+        if not self.fallbacks:
+            return []
+        from langchain.agents.middleware import ModelFallbackMiddleware
+
+        return [ModelFallbackMiddleware(self.fallbacks[0], *self.fallbacks[1:])]
+
 
 class RotationStrategy(str, Enum):
-    ROLE_BASED = "role_based"  # 역할별 모델 분리 (예: Lead/Reviewer=Gemini, Builder/Workers=Qwen 3.8 Flash)
-    ROUND_ROBIN = "round_robin"  # 매 요청마다 활성 프로바이더를 순환 호출 (Rate Limit 분산)
-    FALLBACK = "fallback"  # 주 프로바이더 호출 실패 시 다음 활성 프로바이더로 자동 전환
-    SINGLE = "single"  # 단일 지정 프로바이더만 사용
+    ROLE_BASED = "role_based"
+    ROUND_ROBIN = "round_robin"
+    FALLBACK = "fallback"
+    SINGLE = "single"
 
 
 @dataclass
 class ProviderConfig:
     """개별 LLM 프로바이더 설정."""
 
-    provider_id: str  # "qwen" | "gemini" | "openai" | "mock"
+    provider_id: str  # "qwen" | "gemini" | "openai"
     label: str
     base_url: str
     api_key: str
     model: str
     enabled: bool = True
-    is_mock: bool = False
     calls_count: int = 0
     errors_count: int = 0
     last_latency_ms: float = 0.0
     last_error: str = ""
 
     def has_valid_credentials(self) -> bool:
-        if self.is_mock:
-            return True
-        if not self.api_key:
+        cleaned = (self.api_key or "").strip()
+        if not cleaned:
             return False
+        if self.provider_id == "qwen" and cleaned == "EMPTY":
+            return True
         placeholder_prefixes = ("your-", "internal-qwen-api-key", "sk-placeholder")
-        return not any(self.api_key.startswith(p) for p in placeholder_prefixes)
+        return not any(cleaned.startswith(p) for p in placeholder_prefixes)
 
     def to_public_dict(self) -> dict[str, Any]:
         masked_key = ""
-        if self.api_key:
-            if self.is_mock:
-                masked_key = "mock-key"
-            elif not self.has_valid_credentials():
-                masked_key = ""
+        if self.api_key and self.has_valid_credentials():
+            if self.api_key == "EMPTY":
+                masked_key = "EMPTY (unauthenticated internal)"
             elif len(self.api_key) > 8:
                 masked_key = f"{self.api_key[:4]}...{self.api_key[-4:]}"
             else:
@@ -77,7 +102,6 @@ class ProviderConfig:
             "has_credentials": self.has_valid_credentials(),
             "model": self.model,
             "enabled": self.enabled,
-            "is_mock": self.is_mock,
             "calls_count": self.calls_count,
             "errors_count": self.errors_count,
             "last_latency_ms": round(self.last_latency_ms, 1),
@@ -101,13 +125,14 @@ class RotationLogEntry:
 
 
 class LLMProviderRotator:
-    """멀티 프로바이더 LLM 로테이션 및 Fallback 라우터."""
+    """멀티 프로바이더 Live LLM 로테이션 및 Fallback 라우터."""
 
     def __init__(self) -> None:
         self.strategy: RotationStrategy = RotationStrategy(
             os.getenv("ROTATION_STRATEGY", "role_based")
         )
-        self.active_single_provider: str = os.getenv("ACTIVE_PROVIDER", "gemini")
+        raw_active = os.getenv("ACTIVE_PROVIDER", "gemini").strip()
+        self.active_single_provider: str = raw_active if raw_active in ("qwen", "gemini", "openai") else "gemini"
 
         self.providers: dict[str, ProviderConfig] = {
             "qwen": ProviderConfig(
@@ -120,7 +145,7 @@ class LLMProviderRotator:
             ),
             "gemini": ProviderConfig(
                 provider_id="gemini",
-                label="Google Gemini 2.5 Flash",
+                label="Google Gemini Flash",
                 base_url=os.getenv(
                     "GEMINI_BASE_URL",
                     "https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -137,18 +162,8 @@ class LLMProviderRotator:
                 model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
                 enabled=os.getenv("OPENAI_ENABLED", "false").lower() == "true",
             ),
-            "mock": ProviderConfig(
-                provider_id="mock",
-                label="Deterministic Simulation (Offline Ready)",
-                base_url="mock://local-harness",
-                api_key="mock-key",
-                model="deterministic-simulator",
-                enabled=True,
-                is_mock=True,
-            ),
         }
 
-        # 역할별 기본 프로바이더 매핑 (서브에이전트 모델 티어링 반영)
         self.role_mapping: dict[str, str] = {
             "lead": "gemini",
             "builder": "qwen",
@@ -158,14 +173,27 @@ class LLMProviderRotator:
             "reviewer": "gemini",
         }
 
-        self.fallback_order: list[str] = ["qwen", "gemini", "openai", "mock"]
+        self.fallback_order: list[str] = ["qwen", "gemini", "openai"]
         self._rr_counter = itertools.count()
         self.rotation_history: list[RotationLogEntry] = []
 
+    def has_live_credentials(self) -> bool:
+        return any(cfg.enabled and cfg.has_valid_credentials() for cfg in self.providers.values())
+
+    def active_live_label(self) -> str | None:
+        for cfg in self.select_candidate_chain("lead", "lead"):
+            if cfg.enabled and cfg.has_valid_credentials():
+                return f"{cfg.provider_id}:{cfg.model}"
+        return None
+
     def get_state(self) -> dict[str, Any]:
+        live_label = self.active_live_label()
         return {
             "strategy": self.strategy.value,
             "active_single_provider": self.active_single_provider,
+            "has_live_credentials": live_label is not None,
+            "active_live_label": live_label,
+            "status_banner": f"🟢 LIVE LLM ({live_label})" if live_label else LLM_CONFIG_REQUIRED_BANNER,
             "role_mapping": dict(self.role_mapping),
             "fallback_order": list(self.fallback_order),
             "providers": {
@@ -192,7 +220,9 @@ class LLMProviderRotator:
         if "strategy" in payload:
             self.strategy = RotationStrategy(payload["strategy"])
         if "active_single_provider" in payload:
-            self.active_single_provider = str(payload["active_single_provider"])
+            candidate = str(payload["active_single_provider"])
+            if candidate in self.providers:
+                self.active_single_provider = candidate
         if "role_mapping" in payload and isinstance(payload["role_mapping"], dict):
             for role_key, pid in payload["role_mapping"].items():
                 if pid in self.providers:
@@ -216,193 +246,134 @@ class LLMProviderRotator:
         """현재 로테이션 전략에 따라 시도할 프로바이더 우선순위 체인을 반환합니다."""
         enabled_list = [cfg for cfg in self.providers.values() if cfg.enabled]
         if not enabled_list:
-            return [self.providers["mock"]]
+            return []
 
         if self.strategy == RotationStrategy.SINGLE:
-            primary = self.providers.get(self.active_single_provider, self.providers["mock"])
+            primary = self.providers.get(self.active_single_provider) or enabled_list[0]
             rest = [
                 self.providers[pid]
                 for pid in self.fallback_order
                 if pid != primary.provider_id and self.providers[pid].enabled
             ]
-            return [primary, *rest]
+            return ([primary] if primary.enabled else []) + rest
 
         if self.strategy == RotationStrategy.ROLE_BASED:
             target_pid = self.role_mapping.get(agent_id) or self.role_mapping.get(role, "qwen")
-            primary = self.providers.get(target_pid, self.providers["mock"])
+            primary = self.providers.get(target_pid) or enabled_list[0]
             rest = [
                 self.providers[pid]
                 for pid in self.fallback_order
                 if pid != primary.provider_id and self.providers[pid].enabled
             ]
-            return [primary, *rest]
+            return ([primary] if primary.enabled else []) + rest
 
         if self.strategy == RotationStrategy.ROUND_ROBIN:
             ready = [cfg for cfg in enabled_list if cfg.has_valid_credentials()]
-            if not ready:
-                ready = [self.providers["mock"]]
-            idx = next(self._rr_counter) % len(ready)
-            rotated = ready[idx:] + ready[:idx]
-            if self.providers["mock"] not in rotated:
-                rotated.append(self.providers["mock"])
-            return rotated
+            pool = ready or enabled_list
+            idx = next(self._rr_counter) % len(pool)
+            return pool[idx:] + pool[:idx]
 
         # FALLBACK 전략
-        chain = [
+        return [
             self.providers[pid]
             for pid in self.fallback_order
             if pid in self.providers and self.providers[pid].enabled
         ]
-        if not chain:
-            chain = [self.providers["mock"]]
-        return chain
 
-    def invoke_chat(
-        self,
-        agent_id: str,
-        role: str,
-        messages: list[dict[str, Any]],
-        tools_schema: list[dict[str, Any]] | None = None,
-        mock_responder: Any | None = None,
-    ) -> dict[str, Any]:
+    def build_chat_model(self, agent_id: str, role: str) -> ChatModelSelection:
         """
-        선택된 프로바이더 체인을 따라 OpenAI 호환 Chat Completions API를 호출합니다.
-        실패 또는 자격증명 미설정 시 자동으로 체인의 다음 프로바이더로 Fallback합니다.
+        현재 로테이션 전략으로 LangChain `BaseChatModel`을 만듭니다 (deepagents 엔진용).
+        쓸 수 있는 프로바이더가 하나도 없으면 `LLMConfigurationError` (→ HTTP 503).
         """
         candidates = self.select_candidate_chain(agent_id=agent_id, role=role)
-        fallback_triggered = False
-        fallback_reasons: list[str] = []
-
-        for idx, cfg in enumerate(candidates):
-            start_ts = time.perf_counter()
-            if idx > 0:
-                fallback_triggered = True
-
-            if cfg.is_mock:
-                cfg.calls_count += 1
-                if mock_responder is not None:
-                    result = mock_responder(messages, tools_schema or [])
-                else:
-                    result = {"content": "Simulated response completed.", "tool_calls": []}
-                elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
-                cfg.last_latency_ms = elapsed_ms
-                self.rotation_history.append(
-                    RotationLogEntry(
-                        timestamp=time.time(),
-                        agent_id=agent_id,
-                        role=role,
-                        strategy=self.strategy.value,
-                        selected_provider=f"{cfg.provider_id}:{cfg.model}",
-                        model=cfg.model,
-                        fallback_triggered=fallback_triggered,
-                        fallback_reason="; ".join(fallback_reasons),
-                        latency_ms=elapsed_ms,
-                    )
-                )
-                return {
-                    **result,
-                    "provider": f"{cfg.provider_id}:{cfg.model}",
-                    "fallback_triggered": fallback_triggered,
-                }
-
-            if not cfg.has_valid_credentials():
-                reason = f"{cfg.provider_id} skipped (API key not configured)"
-                fallback_reasons.append(reason)
+        ready: list[ProviderConfig] = []
+        skipped: list[str] = []
+        for cfg in candidates:
+            if cfg in ready:
                 continue
+            if not cfg.enabled:
+                skipped.append(f"{cfg.provider_id} disabled")
+            elif not cfg.has_valid_credentials():
+                skipped.append(f"{cfg.provider_id} skipped (API key not configured)")
+            else:
+                ready.append(cfg)
 
-            try:
-                cfg.calls_count += 1
-                client = OpenAI(
-                    base_url=cfg.base_url,
-                    api_key=cfg.api_key,
-                    timeout=20.0,
-                    max_retries=1,
-                )
-                kwargs: dict[str, Any] = {
-                    "model": cfg.model,
-                    "messages": messages,
-                    "temperature": 0.2,
-                }
-                if tools_schema:
-                    kwargs["tools"] = tools_schema
+        if not ready:
+            raise LLMConfigurationError(
+                f"{LLM_CONFIG_REQUIRED_BANNER}: no enabled LLM provider with valid credentials "
+                f"for agent '{agent_id}' (role '{role}'). "
+                "Set GEMINI_API_KEY (or QWEN_*/OPENAI_*) in .env or configure a provider in the UI."
+            )
 
-                completion = client.chat.completions.create(**kwargs)
-                choice = completion.choices[0].message
-                content = choice.content or ""
-
-                reasoning_extra = getattr(choice, "reasoning_content", None)
-                if reasoning_extra and "<think>" not in content:
-                    content = f"<think>{reasoning_extra}</think>\n{content}"
-
-                parsed_tool_calls: list[dict[str, Any]] = []
-                if choice.tool_calls:
-                    for tc in choice.tool_calls:
-                        parsed_tool_calls.append(
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
-                                },
-                            }
+        models: list[tuple[BaseChatModel, str]] = []
+        for cfg in ready:
+            models.append(
+                (self._instantiate_chat_model(cfg, cfg.model), f"{cfg.provider_id}:{cfg.model}")
+            )
+            if cfg.provider_id == "gemini":
+                flash_fallback = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
+                if flash_fallback and flash_fallback != cfg.model:
+                    models.append(
+                        (
+                            self._instantiate_chat_model(cfg, flash_fallback),
+                            f"gemini:{flash_fallback}",
                         )
-
-                elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
-                cfg.last_latency_ms = elapsed_ms
-                cfg.last_error = ""
-
-                self.rotation_history.append(
-                    RotationLogEntry(
-                        timestamp=time.time(),
-                        agent_id=agent_id,
-                        role=role,
-                        strategy=self.strategy.value,
-                        selected_provider=f"{cfg.provider_id}:{cfg.model}",
-                        model=cfg.model,
-                        fallback_triggered=fallback_triggered,
-                        fallback_reason="; ".join(fallback_reasons),
-                        latency_ms=elapsed_ms,
                     )
-                )
-                return {
-                    "content": content,
-                    "tool_calls": parsed_tool_calls,
-                    "provider": f"{cfg.provider_id}:{cfg.model}",
-                    "fallback_triggered": fallback_triggered,
-                }
-            except Exception as exc:  # noqa: BLE001
-                cfg.errors_count += 1
-                cfg.last_error = str(exc)[:200]
-                fallback_reasons.append(f"{cfg.provider_id} error: {cfg.last_error}")
-                continue
 
-        mock_cfg = self.providers["mock"]
-        mock_cfg.calls_count += 1
-        result = (
-            mock_responder(messages, tools_schema or [])
-            if mock_responder
-            else {"content": "Fallback simulation completed.", "tool_calls": []}
+        primary_cfg = ready[0]
+        primary_cfg.calls_count += 1
+        self.rotation_history.append(
+            RotationLogEntry(
+                timestamp=time.time(),
+                agent_id=agent_id,
+                role=role,
+                strategy=self.strategy.value,
+                selected_provider=models[0][1],
+                model=primary_cfg.model,
+                fallback_triggered=bool(candidates and primary_cfg is not candidates[0]),
+                fallback_reason="; ".join(skipped),
+            )
         )
-        return {
-            **result,
-            "provider": f"mock:{mock_cfg.model}",
-            "fallback_triggered": True,
+        return ChatModelSelection(
+            model=models[0][0],
+            label=models[0][1],
+            fallbacks=[m for m, _ in models[1:]],
+            fallback_labels=[label for _, label in models[1:]],
+        )
+
+    @staticmethod
+    def _instantiate_chat_model(cfg: ProviderConfig, model_name: str) -> BaseChatModel:
+        if cfg.provider_id == "gemini":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+
+            return ChatGoogleGenerativeAI(
+                model=model_name,
+                google_api_key=cfg.api_key,
+                timeout=CHAT_MODEL_TIMEOUT_S,
+                max_retries=CHAT_MODEL_MAX_RETRIES,
+            )
+
+        from langchain_openai import ChatOpenAI
+
+        kwargs: dict[str, Any] = {
+            "model": model_name,
+            "api_key": cfg.api_key,
+            "base_url": cfg.base_url,
+            "temperature": 0.2,
+            "timeout": CHAT_MODEL_TIMEOUT_S,
+            "max_retries": CHAT_MODEL_MAX_RETRIES,
         }
+        if cfg.provider_id == "qwen":
+            import httpx
+
+            kwargs["http_client"] = httpx.Client(trust_env=False, timeout=CHAT_MODEL_TIMEOUT_S)
+        return ChatOpenAI(**kwargs)
 
     def test_provider_connection(self, provider_id: str) -> dict[str, Any]:
-        """웹 UI에서 특정 프로바이더(Qwen, Gemini, OpenAI, Mock) 연결 상태를 즉시 테스트합니다."""
+        """웹 UI에서 특정 프로바이더(Qwen, Gemini, OpenAI) 연결 상태를 즉시 테스트합니다."""
         cfg = self.providers.get(provider_id)
         if not cfg:
             return {"ok": False, "message": f"Unknown provider '{provider_id}'"}
-        if cfg.is_mock:
-            return {
-                "ok": True,
-                "provider_id": provider_id,
-                "model": cfg.model,
-                "latency_ms": 1.2,
-                "message": "Deterministic Mock provider is ready for offline/live demo.",
-            }
         if not cfg.has_valid_credentials():
             return {
                 "ok": False,
@@ -412,24 +383,21 @@ class LLMProviderRotator:
             }
         start_ts = time.perf_counter()
         try:
-            client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key, timeout=10.0, max_retries=0)
-            resp = client.chat.completions.create(
-                model=cfg.model,
-                messages=[{"role": "user", "content": "Reply with OK"}],
-                max_tokens=8,
-            )
+            chat_model = self._instantiate_chat_model(cfg, cfg.model)
+            resp = chat_model.invoke("Reply with OK")
             elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
             cfg.last_latency_ms = elapsed_ms
             cfg.last_error = ""
-            reply = (resp.choices[0].message.content or "OK").strip()
+            reply = str(getattr(resp, "content", "OK") or "OK").strip()
             return {
                 "ok": True,
                 "provider_id": provider_id,
                 "model": cfg.model,
                 "latency_ms": round(elapsed_ms, 1),
-                "message": f"Connected successfully ({round(elapsed_ms, 1)}ms): '{reply}'",
+                "message": f"Connected successfully ({round(elapsed_ms, 1)}ms): '{reply[:60]}'",
             }
         except Exception as exc:  # noqa: BLE001
+            cfg.errors_count += 1
             cfg.last_error = str(exc)[:200]
             return {
                 "ok": False,
