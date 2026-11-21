@@ -142,3 +142,31 @@ $ .venv/bin/pytest -q tests/test_code_mode_agent_api.py tests/test_code_mode.py 
 $ GEMINI_ENABLED=false QWEN_ENABLED=false OPENAI_ENABLED=false .venv/bin/pytest -q
 107 passed in 151.63s (0:02:31)
 ```
+
+---
+
+## Phase 5 — Build & Review (`task_service.py`)
+
+### Changes Made
+- [MODIFY] [task_service.py](../../app/domains/workflow/task_service.py) (2,483줄 → 811줄, 약 1,670줄 감축)
+  - 하드코딩 템플릿(`PROJECT_MAP_*`, `INSPECTION_*`, `CUSTOM_FEATURE_*`), `_preset_blueprint`, `scripted_build_responder`, `llm_bridge` 전면 삭제.
+  - 선언형 `BuildPresetSpec(id, label, badge, instruction, preview_rel_path, completion_cmd, rubric)` 전환.
+  - `_run_build_sync`: 자격증명 검증(미설정 시 즉시 HTTP 503) → 격리 Worktree 생성 → `GuardedWorktreeBackend` + `DeepAgentRuntime(mode="builder", workflow="planning")` 실행. 게이트 통과 시에만 커밋 및 원격 push를 수행하고, 실패 시 `status="failed"`로 기록하며 커밋하지 않음.
+  - `walkthrough.md`로부터 Git 커밋 메시지 본문과 `mr_description`을 자동 생성.
+  - `AGENT_PLAN_REVIEW=request_review`(기본값) 지원: `status="awaiting_plan_review"` 상태에서 `GET /api/workflow/tasks/{task_id}`로 산출물 조회 및 `POST /api/workflow/tasks/{task_id}/plan/approve {comments?, proceed?}`로 재개·완료.
+  - `_run_review_sync`: Detached Ephemeral Worktree + `ReadOnlyGuardedBackend` + `DeepAgentRuntime(mode="reviewer", response_format=ReviewFindings)` 실행 결과를 `EvaluatorRubric.merge_llm_findings`로 병합.
+- [MODIFY] [evaluator.py](../../app/domains/workflow/evaluator.py): 순수 표준 라이브러리 기반 `merge_llm_findings(report, findings, llm_summary="") -> DiffReviewReport` 추가(파일·라인·심각도 중복 제거 및 루브릭 점수·판정 재계산).
+- [MODIFY] [router.py](../../app/domains/workflow/router.py), [schemas.py](../../app/domains/workflow/schemas.py), [container.py](../../app/core/container.py), [provider_rotator.py](../../app/core/llm/provider_rotator.py): `GET /api/workflow/tasks/{task_id}`, `POST /api/workflow/tasks/{task_id}/plan/approve`, `ReviewFindings` 스키마 추가 및 HTTP 503 예외 투과 처리.
+- [MODIFY] [test_coding_agent_tasks.py](../../tests/test_coding_agent_tasks.py), [test_internal_git.py](../../tests/test_internal_git.py): `ScriptedDeepAgentChatModel` 기반으로 전환하고 503 Fail-Fast, `request_review` 승인 플로우, 게이트 실패 시 미커밋 보장, `merge_llm_findings` 중복 제거·재채점 테스트 검증.
+
+### 계획과 달라진 점
+- `worktree_tools.py`는 아직 `coordinator.py`에서 import하고 있어 Phase 5 커밋의 전체 테스트 green을 지키기 위해 `task_service.py`에서의 의존성만 먼저 제거(`deepagent_backend._safe_env` 사용)했고, 파일 삭제는 `coordinator.py`를 전환하는 Phase 6에서 함께 수행합니다.
+
+### Validation Results
+```text
+$ .venv/bin/pytest -q tests/test_coding_agent_tasks.py tests/test_internal_git.py tests/test_ddd_architecture.py
+31 passed in 46.06s
+
+$ GEMINI_ENABLED=false QWEN_ENABLED=false OPENAI_ENABLED=false .venv/bin/pytest -q
+103 passed in 67.20s (0:01:07)
+```

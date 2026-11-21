@@ -244,12 +244,19 @@ async def test_plain_non_git_local_folder_onboarding_and_non_mutating_build(tmp_
     assert len(pkg["socratic_ladder"]) == 3
 
     # 2. Act 2 Build on plain non-git local folder isolates cleanly and NEVER mutates original folder!
-    task_svc = CodingTaskService(settings=settings)
+    from tests.test_coding_agent_tasks import _make_builder_double
+
+    builder_double = _make_builder_double(repo_title="my_plain_project")
+    task_svc = CodingTaskService(
+        settings=settings,
+        model_factory=lambda _aid, _role: (builder_double, "scripted:plain-folder"),
+    )
     build_res = await task_svc.run_build_task(
         repo_url_or_path=str(plain_dir),
         instruction="일반 로컬 폴더 프로젝트 지도 만들어줘",
         preset="project_map_app",
         push_to_remote=False,
+        plan_review="always_proceed",
     )
     assert build_res["status"] == "completed"
     assert build_res["test_result"]["passed"] is True

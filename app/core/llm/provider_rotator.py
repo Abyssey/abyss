@@ -37,6 +37,8 @@ CHAT_MODEL_MAX_RETRIES = 2
 class LLMConfigurationError(RuntimeError):
     """활성화된 프로바이더 중 유효한 자격증명이 하나도 없을 때 발생합니다 (→ HTTP 503)."""
 
+    http_status_code: int = 503
+
 
 @dataclass
 class ChatModelSelection:

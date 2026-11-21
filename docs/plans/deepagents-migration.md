@@ -14,7 +14,7 @@
 - [x] Phase 2 — `GuardedWorktreeBackend` (`app/domains/execution/`)
 - [x] Phase 3 — `DeepAgentRuntime` (옆에 추가)
 - [x] Phase 4 — Execution API (`POST /api/code-mode/agent`)
-- [ ] Phase 5 — Build & Review (`task_service.py`)
+- [x] Phase 5 — Build & Review (`task_service.py`)
 - [ ] Phase 6 — 멀티에이전트 팀 & mock 완전 제거
 - [ ] Phase 7 — 관제 UI
 - [ ] Phase 8 — 아키텍처 규칙, 문서, PR

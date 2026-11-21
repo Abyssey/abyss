@@ -55,6 +55,7 @@ def build_container(
         settings=effective_settings,
         rotator=rotator,
         event_callback=coordinator.emit_event,
+        model_factory=rotator.build_chat_model,
     )
     code_mode_service = CodeModeLabService(
         sandbox_root=effective_settings.code_mode_sandbox,

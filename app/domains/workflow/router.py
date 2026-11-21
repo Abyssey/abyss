@@ -24,6 +24,7 @@ from app.domains.workflow.catalog_service import ArchitectureCatalogService
 from app.domains.workflow.coordinator import MultiAgentTeamCoordinator
 from app.domains.workflow.schemas import (
     BuildTaskRequest,
+    PlanApproveRequest,
     ReviewTaskRequest,
     WorkflowTriggerPayload,
 )
@@ -102,8 +103,42 @@ async def build_coding_task(
             base_branch=req.base_branch,
             use_code_mode=req.use_code_mode,
             push_to_remote=req.push_to_remote,
+            plan_review=req.plan_review,
         )
     except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "http_status_code", None) == 503:
+            raise
+        raise HTTPException(status_code=400, detail=task_service.sanitize_error(exc)) from exc
+
+
+@router.get("/api/workflow/tasks/{task_id}")
+async def get_coding_task_detail(
+    task_id: str,
+    task_service: CodingTaskService = Depends(get_task_service),
+) -> dict[str, Any]:
+    try:
+        return task_service.get_task_detail(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/api/workflow/tasks/{task_id}/plan/approve")
+async def approve_coding_task_plan(
+    task_id: str,
+    req: PlanApproveRequest,
+    task_service: CodingTaskService = Depends(get_task_service),
+) -> dict[str, Any]:
+    try:
+        return await task_service.approve_build_plan(
+            task_id=task_id,
+            comments=req.comments,
+            proceed=req.proceed,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "http_status_code", None) == 503:
+            raise
         raise HTTPException(status_code=400, detail=task_service.sanitize_error(exc)) from exc
 
 
@@ -123,6 +158,8 @@ async def review_coding_task(
             run_tests=req.run_tests,
         )
     except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "http_status_code", None) == 503:
+            raise
         raise HTTPException(status_code=400, detail=task_service.sanitize_error(exc)) from exc
 
 
