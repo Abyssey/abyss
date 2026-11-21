@@ -13,7 +13,7 @@
 - [x] Phase 1 — 의존성 & LangChain 모델 팩토리 (`app/core/llm/`)
 - [x] Phase 2 — `GuardedWorktreeBackend` (`app/domains/execution/`)
 - [x] Phase 3 — `DeepAgentRuntime` (옆에 추가)
-- [ ] Phase 4 — Execution API (`POST /api/code-mode/agent`)
+- [x] Phase 4 — Execution API (`POST /api/code-mode/agent`)
 - [ ] Phase 5 — Build & Review (`task_service.py`)
 - [ ] Phase 6 — 멀티에이전트 팀 & mock 완전 제거
 - [ ] Phase 7 — 관제 UI

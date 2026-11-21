@@ -60,6 +60,7 @@ def build_container(
         sandbox_root=effective_settings.code_mode_sandbox,
         main_checkout_root=effective_settings.demo_workspace,
         event_callback=coordinator.emit_event,
+        model_factory=rotator.build_chat_model,
     )
     catalog_service = ArchitectureCatalogService(repo_root=effective_settings.repo_root)
     onboarding_service = OnboardingService(settings=effective_settings)

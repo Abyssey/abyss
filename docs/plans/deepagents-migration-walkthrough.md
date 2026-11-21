@@ -122,3 +122,23 @@ $ .venv/bin/pytest -q tests/test_deepagent_runtime.py tests/test_artifact_workfl
 $ GEMINI_ENABLED=false QWEN_ENABLED=false OPENAI_ENABLED=false .venv/bin/pytest -q
 103 passed in 147.79s (0:02:27)
 ```
+
+---
+
+## Phase 4 — Execution API (`POST /api/code-mode/agent`)
+
+### Changes Made
+- [MODIFY] [schemas.py](../../app/domains/execution/schemas.py): `CodeModeAgentRequest(instruction, mode: "direct" | "repl", scenario_id?, reset_sandbox?, completion_cmd?, rubric?)` 요청 스키마 추가(빈 지시문 HTTP 422 검증 포함).
+- [MODIFY] [service.py](../../app/domains/execution/service.py): `CodeModeLabService`에 `model_factory` 콜백 주입과 `run_agent` 메서드 추가. `app.core`를 직접 import하지 않고(DDD 경계 유지) `GuardedWorktreeBackend` + `DeepAgentRuntime(mode="direct" | "repl", workflow="fast")`으로 자연어 지시문을 샌드박스에서 실행. 기존 `POST /api/code-mode/run` 오프라인 가드레일 시나리오는 그대로 유지.
+- [MODIFY] [router.py](../../app/domains/execution/router.py): `POST /api/code-mode/agent` 엔드포인트 등록.
+- [MODIFY] [container.py](../../app/core/container.py): `CodeModeLabService(..., model_factory=rotator.build_chat_model)` 연결(자격증명 미설정 시 `LLMConfigurationError` → HTTP 503 `⛔ LLM CONFIG REQUIRED`).
+- [NEW] [test_code_mode_agent_api.py](../../tests/test_code_mode_agent_api.py): `repl` 모드, `direct` 모드 + 가드레일 차단 기록, 자격증명 미설정 시 HTTP 503, 오프라인 `/run` 시나리오 동작 검증 테스트 4개 추가.
+
+### Validation Results
+```text
+$ .venv/bin/pytest -q tests/test_code_mode_agent_api.py tests/test_code_mode.py tests/test_ddd_architecture.py
+32 passed in 6.91s
+
+$ GEMINI_ENABLED=false QWEN_ENABLED=false OPENAI_ENABLED=false .venv/bin/pytest -q
+107 passed in 151.63s (0:02:31)
+```
