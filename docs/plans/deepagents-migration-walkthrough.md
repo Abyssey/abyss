@@ -191,3 +191,22 @@ $ grep -rnE "mock_responder|seed_templates|deepagents_adapter|PROJECT_MAP_BUILDE
 $ GEMINI_ENABLED=false QWEN_ENABLED=false OPENAI_ENABLED=false .venv/bin/pytest -q
 104 passed in 34.55s
 ```
+
+---
+
+## Phase 7 — 관제 UI (`app/static/{index.html,app.js,styles.css}`)
+
+### Changes Made
+- [MODIFY] [index.html](../../app/static/index.html), [app.js](../../app/static/app.js), [styles.css](../../app/static/styles.css)
+  - 상단 엔진 배지 고정(`langchain-ai/deepagents v0.7`), 기존 `engine-select` 및 모든 `mock` 옵션 제거.
+  - 실시간 LLM 상태 배지(`🟢 LIVE LLM (…) ` / `⛔ LLM CONFIG REQUIRED`) 및 자격증명 미설정 안내 배너(`#llm-config-warning-banner`) 추가, HTTP 503 에러 상세 메시지 표시 연결.
+  - **Antigravity 3단계 산출물 패널(`#build-artifacts-panel`)**: HTML 이스케이프 기반 경량 Markdown 렌더러(`renderSafeMarkdown`)로 `implementation_plan.md`, `task.md`(`write_todos` 체크리스트), `walkthrough.md` 카드 표시. `status === "awaiting_plan_review"` 시 인라인 코멘트 입력 + **✓ Proceed (실행 시작)** / **코멘트로 계획 수정** 버튼으로 `POST /api/workflow/tasks/{task_id}/plan/approve` 호출.
+  - 작업 결과 텔레메트리: `PytestGateMiddleware` · `RubricMiddleware` 게이트 평가, `task` 서브에이전트 위임 내역, `Turn N: Tool -> Observation` 타임라인 및 팀 빌드 `team_artifacts` 카드 렌더링.
+  - Tab 6(Code Mode Lab): 자연어 에이전트 실행 패널(`POST /api/code-mode/agent`, `repl` / `direct` 모드 전환) 추가.
+- [MODIFY] [test_web_server.py](../../tests/test_web_server.py): Phase 7 UI 요소, `mock`/`engine-select` 제거 여부, `node --check app/static/app.js` 검증 추가.
+
+### Validation Results
+```text
+$ node --check app/static/app.js && GEMINI_ENABLED=false QWEN_ENABLED=false OPENAI_ENABLED=false .venv/bin/pytest -q
+104 passed in 34.81s
+```

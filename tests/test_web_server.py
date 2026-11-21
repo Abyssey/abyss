@@ -201,6 +201,17 @@ def test_frontend_edge_cases_custom_chip_preview_reset_and_beginner_copy() -> No
 
     assert 'data-build-preset="custom"' in html_text
     assert "직접 입력 (custom)" in html_text
+    assert "langchain-ai/deepagents v0.7" in html_text
+    assert "⛔ LLM CONFIG REQUIRED" in html_text
+    assert "implementation_plan.md" in html_text
+    assert "walkthrough.md" in html_text
+    assert 'id="approve-plan-proceed-btn"' in html_text
+    assert 'id="codemode-agent-mode"' in html_text
+    assert 'value="mock"' not in html_text
+    assert "engine-select" not in html_text
+    assert "/plan/approve" in js_text
+    assert "/api/code-mode/agent" in js_text
+    assert "renderSafeMarkdown" in js_text
     assert "custom:" in js_text
     assert "iframe.removeAttribute('src')" in js_text
     assert "iframe.removeAttribute('srcdoc')" in js_text
