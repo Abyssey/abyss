@@ -11,7 +11,7 @@
 
 - [x] Phase 0 — 계획 보관 (`docs/plans/deepagents-migration.md`)
 - [x] Phase 1 — 의존성 & LangChain 모델 팩토리 (`app/core/llm/`)
-- [ ] Phase 2 — `GuardedWorktreeBackend` (`app/domains/execution/`)
+- [x] Phase 2 — `GuardedWorktreeBackend` (`app/domains/execution/`)
 - [ ] Phase 3 — `DeepAgentRuntime` (옆에 추가)
 - [ ] Phase 4 — Execution API (`POST /api/code-mode/agent`)
 - [ ] Phase 5 — Build & Review (`task_service.py`)
@@ -31,10 +31,11 @@
 
 | 환경 | 셋업 | 테스트 |
 |:-|:-|:-|
+| **WSL2 Ubuntu (기본 작업 환경)** | 작업 사본: `/home/abyss/projects/coding_agent` (Windows에서는 `\\wsl.localhost\Ubuntu\home\abyss\projects\coding_agent`). Ubuntu 26.04에는 Python 3.14만 있고 `python3-venv`가 없어 사용자 영역 `uv`로 3.12를 씁니다: `~/.local/bin/uv venv --seed --python 3.12 .venv` → `~/.local/bin/uv pip install --python .venv/bin/python -e . "deepagents==0.7.41" "langchain-openai>=1.0"` | `.venv/bin/pytest -q` |
 | Windows (PowerShell) | `py -3.12 -m venv .venv` → `.venv\Scripts\pip install -e . "deepagents==0.7.41" "langchain-openai>=1.0"` | `.venv\Scripts\pytest -q` |
-| Linux / WSL2 | `python3.12 -m venv .venv` → `.venv/bin/pip install -e . "deepagents==0.7.41" "langchain-openai>=1.0"` | `.venv/bin/pytest -q` |
 
-- 기준선: `main@99e9ee7`에서 **66 passed** (Linux). Windows 네이티브에서는 OS 차이로 **54 passed, 12 failed**입니다(목록은 [walkthrough Phase 0](deepagents-migration-walkthrough.md#phase-0--계획-보관)). Windows에서 진행할 때는 "기준선 12건 외 신규 실패 0건"을 게이트로 삼습니다.
+- 기준선: `main@99e9ee7`에서 **66 passed** (Linux). Phase 1 이후 WSL2에서 **72 passed**를 확인했습니다. Windows 네이티브에서는 OS 차이로 12건이 실패합니다(목록은 [walkthrough Phase 0](deepagents-migration-walkthrough.md#phase-0--계획-보관)). **Phase 2부터 게이트는 WSL2에서 전체 green**입니다.
+- WSL 작업 사본에서 push할 때는 Windows Git Credential Manager를 저장소 로컬 설정으로 씁니다(`credential.helper=/mnt/c/Program Files/Git/mingw64/bin/git-credential-manager.exe`).
 - `.env`는 `.env.example`을 복사해 `GEMINI_API_KEY`를 채웁니다. `.env`는 `.gitignore` 대상이며, **실제 키를 `.env.example`에 넣어 커밋하지 마세요.**
 
 > [!WARNING]
@@ -202,6 +203,7 @@ class ReadOnlyGuardedBackend(FilesystemBackend):
 ```
 - 차단되면 `blocked_attempts`를 기록하고 감사 이벤트를 남긴 뒤, 에이전트에게는 `[WORKTREE ISOLATION REFUSAL - <check>]` 피드백을 돌려줍니다.
 - 기본 권한 규칙 `DEFAULT_PERMISSIONS = [FilesystemPermission(["read","write"], ["/.env*","/**/.env*","/.git/**"], "deny")]`
+- *(구현 결과)* 동기 메서드만 감쌉니다. deepagents의 비동기 메서드(`aread`, `aexecute` 등)는 모두 `asyncio.to_thread`로 동기 메서드를 부르므로 두 경로가 함께 막힙니다. `ls`/`glob`/`grep` 결과에서는 `.git` 내부·`.env*`·심볼릭 링크 탈출 경로를 조용히 걸러 내고, `grep`·`read`·`execute` 출력의 시크릿 값은 `[REDACTED]`로 바꿉니다. `PermissionRules`의 `ask` 규칙(`pip install`, `git reset --hard` 등)은 자율 에이전트에게는 거부로 처리합니다(사람 승인 연결은 Phase 3의 `interrupt` 모드에서 검토).
 - Windows 네이티브에서는 `.venv/bin` 대신 `.venv\Scripts`를 PATH 선두에 두도록 `_safe_env`가 OS를 감지해야 합니다(WSL2 권장).
 
 #### [NEW] `tests/test_deepagent_backend.py`

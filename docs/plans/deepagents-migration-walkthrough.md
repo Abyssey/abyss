@@ -61,3 +61,32 @@
 ### Notes
 - 계획 검토 방식은 사용자 결정에 따라 기본값을 `request_review`로 바꿨습니다(계획 문서의 Plan Review Policy 절과 Phase 5·6·7 반영).
 - 기존 `tests/test_provider_rotator.py`는 mock 폴백을 전제로 하는데, `.env`에 실제 `GEMINI_API_KEY`가 있으면 Gemini OpenAI 호환 엔드포인트를 실제로 호출할 수 있습니다. 이 테스트는 Phase 6에서 mock을 지울 때 함께 정리합니다.
+
+---
+
+## Phase 2 — `GuardedWorktreeBackend`
+
+### Changes Made
+- 개발 환경을 WSL2 Ubuntu 26.04로 옮김: 작업 사본 `/home/abyss/projects/coding_agent`, Python 3.12.16(사용자 영역 `uv`), 패키지 조합은 검증된 조합과 동일. Phase 1 상태에서 **72 passed**(Windows에서 실패하던 12건 포함 전부 통과) 확인.
+- [NEW] [deepagent_backend.py](../../app/domains/execution/deepagent_backend.py)
+  - `GuardedWorktreeBackend(LocalShellBackend)`: `ls`/`read`/`glob`/`grep`/`download` → Check #1b(읽기 범위), `write`/`edit`/`delete`/`upload` → Check #1(파일 수정), 그 뒤 `PermissionRules`(`.env*`는 깊이와 상관없이 거부). `execute` → `PermissionRules.evaluate("Bash")` → `validate_shell_command`(Check #2~#4) → 실행 → 시크릿 마스킹 → 앞뒤 보존 절단.
+  - `ReadOnlyGuardedBackend(FilesystemBackend)`: 같은 읽기 가드 + 모든 쓰기 거부, `execute` 없음.
+  - `BlockedAttempt` 기록 + `on_block` 콜백(감사 이벤트용), 피드백 형식 `[WORKTREE ISOLATION REFUSAL - <check>] … Hint: …`.
+  - `_safe_env`: 시크릿 환경변수 제거, `worktree/.venv/bin` → 현재 인터프리터 bin 순으로 PATH 앞에 둠(Windows면 `Scripts`).
+  - `DEFAULT_PERMISSIONS`(deepagents `FilesystemPermission`): Phase 3에서 `create_deep_agent(permissions=...)`에 넘김.
+- [NEW] [test_deepagent_backend.py](../../tests/test_deepagent_backend.py): 21개 테스트.
+
+### Validation Results
+```text
+$ .venv/bin/pytest -q tests/test_deepagent_backend.py tests/test_ddd_architecture.py
+33 passed in 2.98s
+
+$ .venv/bin/pytest -q            (WSL2 전체)
+93 passed in 215.61s
+```
+검증한 시나리오: `../../main/.env` 탈출, 심볼릭 링크 탈출, `.git/config` 수정·읽기, `.env`/`config/.env.production`, 목록·검색에서 `.git`·`.env` 숨김, `read`/`grep`/`cat`/`env` 출력의 시크릿 마스킹, `cd app && git push origin main`·`git -C ../../main status`·`git reset --hard`·`sh -c`·`$(...)`·`cd ../../main`·`curl`·`pip install` 차단, worktree 안 `pytest` 통과/실패 감지, 긴 출력 앞뒤 보존, 읽기 전용 백엔드의 쓰기·실행 거부.
+
+### Notes
+- `PermissionRules`의 `ask` 규칙은 자율 실행 중에는 거부로 처리합니다. 사람 승인으로 이어 주는 방식은 Phase 3에서 `FilesystemPermission(mode="interrupt")`와 `interrupt_on`을 검토합니다.
+- 차단 검사 순서상 `git -C ../../main reset --hard`는 Check #3보다 먼저 `permission:ask`(git reset --hard)로 걸립니다. 어느 쪽이든 실행되지 않습니다.
+- Windows 쪽 작업 사본(`C:\Users\User\Desktop\Dev\abyss`)은 이제 보조용입니다. 이어서 작업할 때는 WSL 작업 사본을 쓰세요.
