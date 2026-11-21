@@ -10,7 +10,7 @@
 ## 진행 체크리스트
 
 - [x] Phase 0 — 계획 보관 (`docs/plans/deepagents-migration.md`)
-- [ ] Phase 1 — 의존성 & LangChain 모델 팩토리 (`app/core/llm/`)
+- [x] Phase 1 — 의존성 & LangChain 모델 팩토리 (`app/core/llm/`)
 - [ ] Phase 2 — `GuardedWorktreeBackend` (`app/domains/execution/`)
 - [ ] Phase 3 — `DeepAgentRuntime` (옆에 추가)
 - [ ] Phase 4 — Execution API (`POST /api/code-mode/agent`)
@@ -100,8 +100,9 @@ flowchart LR
 
 Antigravity의 [Artifact review policy](https://antigravity.google/docs/artifact-review)를 그대로 옮깁니다. `.env`의 `AGENT_PLAN_REVIEW`로 고릅니다.
 
-- `always_proceed` (**기본값**): 계획을 쓰고 바로 실행합니다. 테스트와 `scripts/demo.sh`가 사람 개입 없이 끝까지 돕니다.
-- `request_review`: 계획을 쓴 뒤 LangGraph `interrupt()`로 멈춥니다(체크포인터 필요). UI의 **Proceed** 버튼이나 `POST /api/workflow/tasks/{id}/plan/approve {comments?}`로 재개하며, 코멘트는 Antigravity의 코멘트 칩처럼 다음 `HumanMessage`에 붙어 계획을 고치게 합니다.
+- `request_review` (**기본값**, Antigravity 기본 동작과 같음): 계획을 쓴 뒤 LangGraph `interrupt()`로 멈춥니다(체크포인터 필요). 작업 상태는 `awaiting_plan_review`가 되고, UI의 **Proceed** 버튼이나 `POST /api/workflow/tasks/{id}/plan/approve {comments?}`로 재개합니다. 코멘트는 Antigravity의 코멘트 칩처럼 다음 `HumanMessage`에 붙어 계획을 고치게 합니다.
+- `always_proceed`: 계획을 쓰고 바로 실행합니다.
+- 자동화 경로: 테스트는 `plan_review`를 명시적으로 넘기거나 승인 API를 호출하고, `scripts/demo.sh`는 계획이 나오면 승인 API를 호출해 끝까지 진행합니다.
 
 ### Antigravity SDK 개념 ↔ deepagents 구현 대응
 
@@ -173,9 +174,9 @@ Phase마다 Changes Made / Validation Results를 쌓는 walkthrough입니다. �
 `langchain-google-genai`는 원안의 `>=2.0.0`이 아니라 deepagents가 요구하는 `>=4.4.3`으로 맞춥니다. [Dockerfile](../../Dockerfile)은 `pip install .`로 의존성을 자동 설치하므로 변경하지 않습니다.
 
 #### [MODIFY] [provider_rotator.py](../../app/core/llm/provider_rotator.py)
-- `build_chat_model(agent_id, role) -> tuple[BaseChatModel, str]`를 추가합니다.
-  - `gemini` → `ChatGoogleGenerativeAI(model, google_api_key, timeout=90, max_retries=2)`, 실패 시 Flash 모델로 폴백(`.with_fallbacks`)
-  - `qwen`/`openai` → `ChatOpenAI(..., http_client=httpx.Client(trust_env=False))`, `QWEN_API_KEY=EMPTY`(인증 없는 내부망) 허용
+- `build_chat_model(agent_id, role) -> ChatModelSelection(model, label, fallbacks, fallback_labels)`를 추가합니다. *(구현 시 변경: 원안의 `tuple[BaseChatModel, str]` + `.with_fallbacks` 대신, `with_fallbacks`가 `bind_tools`를 잃는 문제 때문에 `ChatModelSelection.middleware()` → `ModelFallbackMiddleware`로 장애 조치합니다.)*
+  - `gemini` → `ChatGoogleGenerativeAI(model, google_api_key, timeout=90, max_retries=2)`, `GEMINI_FALLBACK_MODEL`을 설정하면 그 Flash 모델로 폴백
+  - `qwen` → `ChatOpenAI(..., http_client=httpx.Client(trust_env=False))`, `QWEN_API_KEY=EMPTY`(인증 없는 내부망) 허용. `openai`는 공용 엔드포인트라 시스템 프록시를 그대로 씁니다.
   - 유효한 자격증명이 없으면 `LLMConfigurationError` 발생
 - 기존 `role_based`/`round_robin`/`fallback`/`single` 전략은 `select_candidate_chain`을 그대로 재사용합니다.
 - **mock 삭제는 Phase 6**으로 미룹니다. mock을 쓰는 곳이 남아 있는 동안 테스트가 깨지지 않게 하기 위해서예요.
@@ -261,7 +262,7 @@ class DeepAgentRuntime:
 - `_run_build_sync`: Worktree 생성 → `GuardedWorktreeBackend` + `DeepAgentRuntime(mode="builder", workflow="planning")` 실행 → 게이트 통과 시에만 커밋과 push → 프리뷰를 제공합니다. 실패하면 `status="failed"`로 기록하고 커밋하지 않습니다.
   - 커밋 메시지 본문과 MR 설명은 `walkthrough.md`에서 만듭니다.
   - 작업 조회 API(`GET /api/workflow/tasks/{id}`)가 `artifacts`(계획·체크리스트·walkthrough)를 함께 돌려줍니다.
-  - `AGENT_PLAN_REVIEW=request_review`이면 `status="awaiting_plan_review"`로 멈추고, `POST /api/workflow/tasks/{id}/plan/approve {comments?}`로 재개합니다.
+  - `AGENT_PLAN_REVIEW=request_review`(기본값)이면 `status="awaiting_plan_review"`로 멈추고, `POST /api/workflow/tasks/{id}/plan/approve {comments?}`로 재개합니다.
 - `_run_review_sync`: Detached Worktree + `ReadOnlyGuardedBackend` + `response_format=ReviewFindings`(Pydantic) → `EvaluatorRubric.merge_llm_findings`
 
 #### [MODIFY] [evaluator.py](../../app/domains/workflow/evaluator.py)
@@ -279,7 +280,7 @@ class DeepAgentRuntime:
 - 리뷰와 머지 흐름(`EvaluatorRubric`, 순차 머지)은 그대로 둡니다.
 - **[DELETE]** `seed_templates.py`, `deepagents_adapter.py`, `_build_worker_scripted_responder`, `engine_mode` 토글
 #### [MODIFY] [provider_rotator.py](../../app/core/llm/provider_rotator.py), [.env.example](../../.env.example)
-`mock` 프로바이더와 `mock_responder`, `MOCK_ENABLED`를 삭제합니다. `AGENT_RUBRIC_ENABLED`, `AGENT_PLAN_REVIEW=always_proceed`를 추가합니다.
+`mock` 프로바이더와 `mock_responder`, `MOCK_ENABLED`를 삭제합니다. `AGENT_RUBRIC_ENABLED`, `AGENT_PLAN_REVIEW=request_review`를 추가합니다.
 #### [MODIFY] [runtime.py](../../app/domains/execution/runtime.py)
 구 `AgentRuntime`과 수동 while 루프를 삭제합니다.
 
@@ -290,7 +291,7 @@ class DeepAgentRuntime:
 - 엔진 배지: `langchain-ai/deepagents v0.7`
 - LLM 상태 배지: `🟢 LIVE LLM (gemini:…)` 또는 `⛔ LLM CONFIG REQUIRED` + 안내 배너
 - 작업 결과 패널: TodoList, `task` 서브에이전트 위임 내역, `Turn N: Tool → Observation` 타임라인, Rubric/pytest 게이트 결과
-- **Artifact 패널** (Antigravity 방식): Implementation Plan 카드(**Proceed** 버튼 + 코멘트 입력, `request_review`일 때), `task.md` 진행 체크리스트, Walkthrough 카드. Markdown은 기존 정적 자산 안에서 가볍게 렌더링합니다.
+- **Artifact 패널** (Antigravity 방식): Implementation Plan 카드(**Proceed** 버튼 + 코멘트 입력, 기본값 `request_review`), `task.md` 진행 체크리스트, Walkthrough 카드. Markdown은 기존 정적 자산 안에서 가볍게 렌더링합니다.
 - Code Mode 탭: 자연어 에이전트 실행(`direct`/`repl` 전환)
 
 ---

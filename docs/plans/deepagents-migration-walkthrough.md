@@ -27,3 +27,37 @@
 ### Notes
 - 이 PC에는 Python 3.12가 없어 3.13으로 venv를 만들었습니다(`requires-python >=3.11`).
 - WSL이 설치되어 있지 않습니다. 계획대로 Phase마다 "전체 green" 게이트를 지키려면 WSL2(Ubuntu) 설치 후 그 안에서 진행하는 것을 권장합니다. Windows 네이티브로 계속한다면 **게이트를 "기준선 12건 외 신규 실패 0건"으로 해석**합니다.
+
+---
+
+## Phase 1 — 의존성 & LangChain 모델 팩토리
+
+### Changes Made
+- [MODIFY] [pyproject.toml](../../pyproject.toml): `deepagents>=0.7.39,<0.8`, `langchain-openai>=1.0`, `langchain-google-genai>=4.4.3`를 기본 의존성으로 옮기고 `[project.optional-dependencies].deepagents`를 삭제.
+- [MODIFY] [provider_rotator.py](../../app/core/llm/provider_rotator.py)
+  - `LLMConfigurationError`, `LLM_CONFIG_REQUIRED_BANNER = "⛔ LLM CONFIG REQUIRED"` 추가.
+  - `build_chat_model(agent_id, role) -> ChatModelSelection` 추가. `select_candidate_chain` 순서를 그대로 쓰고 mock·비활성·자격증명 없는 프로바이더는 건너뛰며, 건너뛴 이유를 `rotation_history`에 남김.
+  - Gemini → `ChatGoogleGenerativeAI(timeout=90, max_retries=2)`, Qwen → `ChatOpenAI` + `httpx.Client(trust_env=False)`, OpenAI → `ChatOpenAI`.
+  - mock 프로바이더와 `invoke_chat`은 그대로 둠(삭제는 Phase 6).
+- [MODIFY] [main.py](../../app/main.py): `LLMConfigurationError` → HTTP 503 `{"status": "llm_config_required", "error": "⛔ LLM CONFIG REQUIRED", ...}` 예외 핸들러.
+- [MODIFY] [.env.example](../../.env.example): `GEMINI_MODEL=gemini-3.8-flash`(로컬에서 바꿔 둔 값 반영), 선택 항목 `GEMINI_FALLBACK_MODEL` 안내 주석.
+- [NEW] [test_llm_model_factory.py](../../tests/test_llm_model_factory.py): 6개 테스트(자격증명 없음 → 에러, Gemini 네이티브 모델, Flash 폴백 미들웨어, Qwen `EMPTY` 키 + 역할 체인, 주 프로바이더 건너뜀 기록, 503 매핑). 모든 테스트가 프로바이더를 명시적으로 설정해 로컬 `.env`의 실제 키에 영향받지 않음.
+
+### 계획과 달라진 점
+- 원안은 `tuple[BaseChatModel, str]` + `.with_fallbacks()`였지만, `RunnableWithFallbacks`에는 `bind_tools`가 없어 deepagents 그래프에 넣을 수 없습니다(로컬에서 확인). 그래서 `ChatModelSelection.middleware()`가 LangChain `ModelFallbackMiddleware`를 돌려주는 방식으로 바꿨습니다. Phase 3의 `DeepAgentRuntime`이 이 미들웨어를 `create_deep_agent(middleware=...)`에 넣습니다.
+- Gemini Flash 폴백은 모델 이름을 하드코딩하지 않고 `GEMINI_FALLBACK_MODEL`을 설정했을 때만 겁니다.
+- `trust_env=False`는 사내망 Qwen에만 적용합니다. 공용 OpenAI 엔드포인트는 회사 프록시가 필요할 수 있어서입니다.
+
+### Validation Results
+```text
+> .venv\Scripts\pytest -q tests/test_llm_model_factory.py tests/test_provider_rotator.py tests/test_ddd_architecture.py tests/test_web_server.py::test_dockerfile_and_pyproject_pod_packaging_hygiene
+21 passed in 48.00s
+
+> .venv\Scripts\pytest -q -rf        (Windows 네이티브 전체)
+12 failed, 60 passed in 390.52s
+```
+- 실패 12건은 [Phase 0 기준선](#phase-0--계획-보관)과 정확히 같은 목록입니다(신규 실패 0건). 통과는 54 → 60(+6, 새 테스트).
+
+### Notes
+- 계획 검토 방식은 사용자 결정에 따라 기본값을 `request_review`로 바꿨습니다(계획 문서의 Plan Review Policy 절과 Phase 5·6·7 반영).
+- 기존 `tests/test_provider_rotator.py`는 mock 폴백을 전제로 하는데, `.env`에 실제 `GEMINI_API_KEY`가 있으면 Gemini OpenAI 호환 엔드포인트를 실제로 호출할 수 있습니다. 이 테스트는 Phase 6에서 mock을 지울 때 함께 정리합니다.

@@ -17,14 +17,47 @@ from __future__ import annotations
 import itertools
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
 
+if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
+
 load_dotenv()
+
+LLM_CONFIG_REQUIRED_BANNER = "⛔ LLM CONFIG REQUIRED"
+CHAT_MODEL_TIMEOUT_S = 90.0
+CHAT_MODEL_MAX_RETRIES = 2
+
+
+class LLMConfigurationError(RuntimeError):
+    """활성화된 프로바이더 중 유효한 자격증명이 하나도 없을 때 발생합니다 (→ HTTP 503)."""
+
+
+@dataclass
+class ChatModelSelection:
+    """`build_chat_model` 결과: 주 모델 + 장애 조치(Fallback) 모델 체인."""
+
+    model: BaseChatModel
+    label: str
+    fallbacks: list[BaseChatModel] = field(default_factory=list)
+    fallback_labels: list[str] = field(default_factory=list)
+
+    def middleware(self) -> list[Any]:
+        """deepagents/LangChain 에이전트용 `ModelFallbackMiddleware` (fallback이 없으면 빈 리스트).
+
+        `BaseChatModel.with_fallbacks()`는 `bind_tools`를 잃어버리므로 에이전트 그래프에서는
+        미들웨어 방식으로 장애 조치를 겁니다.
+        """
+        if not self.fallbacks:
+            return []
+        from langchain.agents.middleware import ModelFallbackMiddleware
+
+        return [ModelFallbackMiddleware(self.fallbacks[0], *self.fallbacks[1:])]
 
 
 class RotationStrategy(str, Enum):
@@ -256,6 +289,94 @@ class LLMProviderRotator:
         if not chain:
             chain = [self.providers["mock"]]
         return chain
+
+    def build_chat_model(self, agent_id: str, role: str) -> ChatModelSelection:
+        """
+        현재 로테이션 전략으로 LangChain `BaseChatModel`을 만듭니다 (deepagents 엔진용).
+
+        - `select_candidate_chain`의 순서를 그대로 쓰되, mock·비활성·자격증명 없는 프로바이더는 뺍니다.
+        - 첫 번째가 주 모델, 나머지는 `ChatModelSelection.middleware()`의 장애 조치 체인이 됩니다.
+        - 쓸 수 있는 프로바이더가 하나도 없으면 `LLMConfigurationError` (→ HTTP 503).
+        """
+        candidates = self.select_candidate_chain(agent_id=agent_id, role=role)
+        ready: list[ProviderConfig] = []
+        skipped: list[str] = []
+        for cfg in candidates:
+            if cfg.is_mock or cfg in ready:
+                continue
+            if not cfg.enabled:
+                skipped.append(f"{cfg.provider_id} disabled")
+            elif not cfg.has_valid_credentials():
+                skipped.append(f"{cfg.provider_id} skipped (API key not configured)")
+            else:
+                ready.append(cfg)
+
+        if not ready:
+            raise LLMConfigurationError(
+                f"{LLM_CONFIG_REQUIRED_BANNER}: no enabled LLM provider with valid credentials "
+                f"for agent '{agent_id}' (role '{role}'). "
+                "Set GEMINI_API_KEY (or QWEN_*/OPENAI_*) in .env or configure a provider in the UI."
+            )
+
+        models: list[tuple[BaseChatModel, str]] = []
+        for cfg in ready:
+            models.append((self._instantiate_chat_model(cfg, cfg.model), f"{cfg.provider_id}:{cfg.model}"))
+            if cfg.provider_id == "gemini":
+                flash_fallback = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
+                if flash_fallback and flash_fallback != cfg.model:
+                    models.append(
+                        (self._instantiate_chat_model(cfg, flash_fallback), f"gemini:{flash_fallback}")
+                    )
+
+        primary_cfg = ready[0]
+        primary_cfg.calls_count += 1
+        self.rotation_history.append(
+            RotationLogEntry(
+                timestamp=time.time(),
+                agent_id=agent_id,
+                role=role,
+                strategy=self.strategy.value,
+                selected_provider=models[0][1],
+                model=primary_cfg.model,
+                fallback_triggered=primary_cfg is not candidates[0],
+                fallback_reason="; ".join(skipped),
+            )
+        )
+        return ChatModelSelection(
+            model=models[0][0],
+            label=models[0][1],
+            fallbacks=[m for m, _ in models[1:]],
+            fallback_labels=[label for _, label in models[1:]],
+        )
+
+    @staticmethod
+    def _instantiate_chat_model(cfg: ProviderConfig, model_name: str) -> BaseChatModel:
+        if cfg.provider_id == "gemini":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+
+            return ChatGoogleGenerativeAI(
+                model=model_name,
+                google_api_key=cfg.api_key,
+                timeout=CHAT_MODEL_TIMEOUT_S,
+                max_retries=CHAT_MODEL_MAX_RETRIES,
+            )
+
+        from langchain_openai import ChatOpenAI
+
+        kwargs: dict[str, Any] = {
+            "model": model_name,
+            "api_key": cfg.api_key,
+            "base_url": cfg.base_url,
+            "temperature": 0.2,
+            "timeout": CHAT_MODEL_TIMEOUT_S,
+            "max_retries": CHAT_MODEL_MAX_RETRIES,
+        }
+        if cfg.provider_id == "qwen":
+            # 사내망 엔드포인트: 시스템 프록시(HTTP(S)_PROXY)를 타지 않도록 trust_env=False
+            import httpx
+
+            kwargs["http_client"] = httpx.Client(trust_env=False, timeout=CHAT_MODEL_TIMEOUT_S)
+        return ChatOpenAI(**kwargs)
 
     def invoke_chat(
         self,
