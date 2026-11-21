@@ -12,7 +12,7 @@
 - [x] Phase 0 — 계획 보관 (`docs/plans/deepagents-migration.md`)
 - [x] Phase 1 — 의존성 & LangChain 모델 팩토리 (`app/core/llm/`)
 - [x] Phase 2 — `GuardedWorktreeBackend` (`app/domains/execution/`)
-- [ ] Phase 3 — `DeepAgentRuntime` (옆에 추가)
+- [x] Phase 3 — `DeepAgentRuntime` (옆에 추가)
 - [ ] Phase 4 — Execution API (`POST /api/code-mode/agent`)
 - [ ] Phase 5 — Build & Review (`task_service.py`)
 - [ ] Phase 6 — 멀티에이전트 팀 & mock 완전 제거

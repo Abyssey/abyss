@@ -139,6 +139,36 @@ def _find_execution_core_violations(py_file: Path, repo_root: Path = REPO_ROOT) 
     return bad
 
 
+_ALLOWED_DEEPAGENT_PACKAGES = frozenset(
+    {
+        "deepagents",
+        "langchain",
+        "langchain_core",
+        "langgraph",
+        "pydantic",
+        "typing_extensions",
+    }
+)
+
+
+def _find_deepagent_execution_violations(py_file: Path, repo_root: Path = REPO_ROOT) -> list[str]:
+    bad: list[str] = []
+    for mod in _resolve_file_imports(py_file, repo_root=repo_root):
+        top = mod.split(".")[0]
+        allowed = (
+            top in STDLIB
+            or top in _ALLOWED_DEEPAGENT_PACKAGES
+            or _matches_module_prefix(mod, "app.domains.guardrails")
+            or _matches_module_prefix(mod, "app.domains.execution.code_mode")
+            or _matches_module_prefix(mod, "app.domains.execution.runtime")
+            or _matches_module_prefix(mod, "app.domains.execution.deepagent_backend")
+            or _matches_module_prefix(mod, "app.domains.execution.artifact_workflow")
+        )
+        if not allowed:
+            bad.append(mod)
+    return bad
+
+
 def _find_onboarding_violations(py_file: Path, repo_root: Path = REPO_ROOT) -> list[str]:
     forbidden_prefixes = (
         "app.domains.workflow",
@@ -194,11 +224,18 @@ def test_rule_1_guardrails_domain_is_pure_stdlib_and_has_no_router() -> None:
 
 def test_rule_2_execution_core_modules_only_import_stdlib_and_guardrails() -> None:
     exec_dir = APP_DIR / "domains" / "execution"
-    for filename in ("code_mode.py", "runtime.py"):
+    code_mode_file = exec_dir / "code_mode.py"
+    assert code_mode_file.is_file()
+    violations = _find_execution_core_violations(code_mode_file)
+    assert not violations, f"AST Rule #2 Violation in code_mode.py: forbidden imports {violations}"
+
+    for filename in ("runtime.py", "deepagent_backend.py", "artifact_workflow.py"):
         py_file = exec_dir / filename
         assert py_file.is_file()
-        violations = _find_execution_core_violations(py_file)
-        assert not violations, f"AST Rule #2 Violation in {filename}: forbidden imports {violations}"
+        da_violations = _find_deepagent_execution_violations(py_file)
+        assert not da_violations, (
+            f"AST Rule #2 Violation in {filename}: forbidden imports {da_violations}"
+        )
 
     forbidden_exec = (
         "app.domains.workflow",
@@ -214,6 +251,9 @@ def test_rule_2_execution_core_modules_only_import_stdlib_and_guardrails() -> No
                 f"AST Rule #2 Cross-Domain Violation in execution/{py_file.name}: '{mod}'"
             )
             if py_file.name != "router.py":
+                assert not _matches_module_prefix(mod, "app.core"), (
+                    f"AST Rule #2 Core Violation in execution/{py_file.name}: '{mod}'"
+                )
                 assert not (
                     _matches_module_prefix(mod, "fastapi")
                     or _matches_module_prefix(mod, "starlette")

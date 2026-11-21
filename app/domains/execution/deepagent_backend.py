@@ -159,7 +159,9 @@ class _WorktreeGuardMixin:
         self.blocked_attempts: list[BlockedAttempt] = []
 
     # ------------------------------------------------------------------ helpers
-    def _real_path(self, virtual_path: str | None) -> Path:
+    def _host_path(self, virtual_path: str | None) -> Path:
+        # Named `_host_path` (not `_real_path`) so `FilesystemBackend._real_path(key) -> str`
+        # stays intact for `FilesystemMiddleware` permission checks.
         key = (virtual_path or "/").replace("\\", "/")
         return self.worktree_root / key.lstrip("/")
 
@@ -197,7 +199,7 @@ class _WorktreeGuardMixin:
     def _guard_path(self, operation: str, virtual_path: str | None) -> str | None:
         """Return refusal feedback if the path operation must be blocked, else None."""
         target = virtual_path or "/"
-        real = self._real_path(virtual_path)
+        real = self._host_path(virtual_path)
         writes = operation in ("write", "edit", "delete", "upload")
         verdict = self.policy.validate_file_edit(real) if writes else self.policy.validate_file_read(real)
         if not verdict.allowed:
@@ -205,9 +207,13 @@ class _WorktreeGuardMixin:
         tool = {"write": "Write", "upload": "Write", "delete": "Write", "edit": "Edit"}.get(operation, "Read")
         return self._permission_refusal(operation, tool, target, self._relative_subject(real))
 
+    def guard_tool_path(self, operation: str, virtual_path: str | None) -> str | None:
+        """Pre-flight path check used before deepagents' own tool validation runs."""
+        return self._guard_path(operation, virtual_path)
+
     def _is_visible(self, virtual_path: str) -> bool:
         """Silent filter for listing/search results (.git internals, secret files, symlink escapes)."""
-        real = self._real_path(virtual_path)
+        real = self._host_path(virtual_path)
         if not self.policy.validate_file_read(real).allowed:
             return False
         return self.permissions.evaluate("Read", self._relative_subject(real)).decision == "allow"
@@ -390,6 +396,11 @@ class ReadOnlyGuardedBackend(_WorktreeGuardMixin, FilesystemBackend):
             f"Reviewer backend is read-only; '{operation}' is not allowed.",
             "Report the problem as a review finding instead of changing files.",
         )
+
+    def guard_tool_path(self, operation: str, virtual_path: str | None) -> str | None:
+        if operation in ("write", "edit", "delete", "upload"):
+            return self._read_only(operation, virtual_path or "/")
+        return super().guard_tool_path(operation, virtual_path)
 
     def write(self, file_path: str, content: str) -> WriteResult:
         return WriteResult(error=self._read_only("write", file_path))

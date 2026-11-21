@@ -90,3 +90,35 @@ $ .venv/bin/pytest -q            (WSL2 전체)
 - `PermissionRules`의 `ask` 규칙은 자율 실행 중에는 거부로 처리합니다. 사람 승인으로 이어 주는 방식은 Phase 3에서 `FilesystemPermission(mode="interrupt")`와 `interrupt_on`을 검토합니다.
 - 차단 검사 순서상 `git -C ../../main reset --hard`는 Check #3보다 먼저 `permission:ask`(git reset --hard)로 걸립니다. 어느 쪽이든 실행되지 않습니다.
 - Windows 쪽 작업 사본(`C:\Users\User\Desktop\Dev\abyss`)은 이제 보조용입니다. 이어서 작업할 때는 WSL 작업 사본을 쓰세요.
+
+---
+
+## Phase 3 — `DeepAgentRuntime` & Antigravity 3-Phase Artifact Workflow
+
+### Changes Made
+- [NEW] [artifact_workflow.py](../../app/domains/execution/artifact_workflow.py)
+  - Antigravity 방식의 3단계 코딩 에이전트 흐름(`PLANNING → EXECUTION → VERIFICATION/WALKTHROUGH`)을 `ArtifactWorkflowMiddleware` + `PlanGateMiddleware`로 구현.
+  - `CompositeBackend`로 `/artifacts/` 경로를 Git Worktree 밖(`data/tasks/<id>/artifacts/` 또는 임시 디렉터리)으로 분리 라우팅해 `git status`와 사용자 커밋을 오염시키지 않음.
+  - PLANNING 단계에서는 읽기 전용 탐색만 허용하고 워크스페이스 수정·셸 실행은 `[PLAN-FIRST REFUSAL]`로 거부.
+  - `AGENT_PLAN_REVIEW` 정책(`request_review` 기본값 / `always_proceed`): `request_review`일 때 `/artifacts/implementation_plan.md` 작성 직후 LangGraph `interrupt()`로 일시 정지하며, `proceed=False`(계획 수정 요청)와 `proceed=True` + 인라인 코멘트 주입 재개를 모두 지원.
+  - `write_todos` 호출 결과를 `/artifacts/task.md`(`[ ]` / `[/]` / `[x]`)로 결정론적 렌더링.
+  - 게이트 통과 후 `/artifacts/walkthrough.md` 필수 섹션(`Changes Made`, `Validation Results`) 누락 시 재요구(최대 2회)하고, 실제 `pytest` 게이트 실행 출력을 `Validation Results` 하단에 결정론적으로 스탬핑(할루시네이션 방지).
+- [MODIFY] [runtime.py](../../app/domains/execution/runtime.py)
+  - `DeepAgentRuntime`, `DeepAgentResult`, `PytestGateMiddleware`, `_GatedRubricMiddleware`, `TurnTraceEntry`, `SubagentCallRecord`, `PytestGateRun` 추가(구 `AgentRuntime`은 Phase 6까지 병행 유지).
+  - `create_deep_agent` 그래프 조립: `TodoListMiddleware`, `ArtifactWorkflowMiddleware`, `PytestGateMiddleware`, `RubricMiddleware`(`AGENT_RUBRIC_ENABLED` 기본 ON), 읽기 전용 서브에이전트(`repo-explorer`, `code-reviewer`), `/AGENTS.md`·`/CLAUDE.md` 메모리 자동 로드, `mode="repl"`용 `run_python`(`CodeModeExecutor`) 도구 연결.
+- [MODIFY] [deepagent_backend.py](../../app/domains/execution/deepagent_backend.py): `FilesystemBackend._real_path(key) -> str`와의 메서드 이름 충돌을 막기 위해 내부 헬퍼를 `_host_path`로 변경하고 프리플라이트 `guard_tool_path` 추가.
+- [MODIFY] [test_ddd_architecture.py](../../tests/test_ddd_architecture.py): Rule #2를 갱신해 `code_mode.py`는 순수 stdlib + guardrails만 유지하고, `runtime.py`·`deepagent_backend.py`·`artifact_workflow.py`는 `deepagents`/`langchain*`/`langgraph`를 허용하되 `workflow`/`onboarding`/`app.core`/`fastapi` 역참조를 차단.
+- [NEW] [helpers_llm_doubles.py](../../tests/helpers_llm_doubles.py), [test_deepagent_runtime.py](../../tests/test_deepagent_runtime.py), [test_artifact_workflow.py](../../tests/test_artifact_workflow.py): `ScriptedDeepAgentChatModel`(`tests/` 전용) 및 엔드투엔드 그래프 테스트 10개 추가.
+
+### 계획과 달라진 점
+- `deepagents 0.7.41`의 `FilesystemMiddleware`는 `SandboxBackendProtocol`(`execute` 지원 백엔드)과 `FilesystemPermission`을 동시에 넘기면 `NotImplementedError`를 발생시킵니다. 실행 백엔드(`GuardedWorktreeBackend`)에서는 백엔드 자체의 4-Check + `PermissionRules`와 `ArtifactWorkflowMiddleware` 프리플라이트 검사가 파일·셸 권한을 모두 강제하므로 `permissions=None`을 넘기고, 비실행 백엔드(`ReadOnlyGuardedBackend`)에만 `DEFAULT_PERMISSIONS`를 함께 전달합니다. 서브에이전트(`repo-explorer`, `code-reviewer`)의 읽기 전용 격리는 `_ReadOnlySubagentMiddleware`로 강제했습니다.
+- LangChain `create_agent`의 `after_agent` 체인은 미들웨어 목록의 역순(안쪽 → 바깥쪽)으로 실행됩니다. 실행 순서가 `PlanGate → PytestGate → RubricMiddleware → WalkthroughGate`가 되도록 스택 순서를 배치했고, 워크스페이스 변경 없이 walkthrough만 작성한 턴에서는 `PytestGate`와 `RubricMiddleware`가 중복 재실행되지 않도록 변경 시퀀스 추적기를 두었습니다.
+
+### Validation Results
+```text
+$ .venv/bin/pytest -q tests/test_deepagent_runtime.py tests/test_artifact_workflow.py tests/test_deepagent_backend.py tests/test_ddd_architecture.py
+43 passed in 10.05s
+
+$ GEMINI_ENABLED=false QWEN_ENABLED=false OPENAI_ENABLED=false .venv/bin/pytest -q
+103 passed in 147.79s (0:02:27)
+```
