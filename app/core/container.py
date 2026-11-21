@@ -50,6 +50,7 @@ def build_container(
         rotator=rotator,
         bare_remote_path=effective_settings.internal_bare_remote,
         settings=effective_settings,
+        model_factory=rotator.build_chat_model,
     )
     task_service = CodingTaskService(
         settings=effective_settings,

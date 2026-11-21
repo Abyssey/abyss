@@ -34,20 +34,17 @@ from app.domains.execution.deepagent_backend import (
 )
 from app.domains.execution.runtime import (
     AgentMode,
-    AgentRuntime,
     DeepAgentResult,
     DeepAgentRuntime,
-    HandoffArtifact,
     PytestGateMiddleware,
     PytestGateRun,
     SubagentCallRecord,
-    ToolCallRecord,
     TurnTraceEntry,
+    extract_thinking_and_content,
 )
 
 __all__ = [
     "AgentMode",
-    "AgentRuntime",
     "ArtifactWorkflowMiddleware",
     "BlockedAttempt",
     "BudgetExceeded",
@@ -61,7 +58,6 @@ __all__ = [
     "DeepAgentResult",
     "DeepAgentRuntime",
     "GuardedWorktreeBackend",
-    "HandoffArtifact",
     "HookSpec",
     "PlanReviewPolicy",
     "PytestGateMiddleware",
@@ -70,12 +66,12 @@ __all__ = [
     "ReadOnlyGuardedBackend",
     "ShellResult",
     "SubagentCallRecord",
-    "ToolCallRecord",
     "ToolRefused",
     "TurnTraceEntry",
     "WorkflowKind",
     "compile_program",
     "default_plan_review_policy",
+    "extract_thinking_and_content",
     "render_task_markdown",
     "stamp_validation_results",
 ]

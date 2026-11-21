@@ -52,7 +52,6 @@ async def run_multi_agent_workflow(
 ) -> dict[str, Any]:
     if coordinator.is_running:
         raise HTTPException(status_code=409, detail="Workflow is already running.")
-    coordinator.engine_mode = payload.engine_mode
     return await coordinator.execute_full_workflow(user_goal=payload.goal)
 
 

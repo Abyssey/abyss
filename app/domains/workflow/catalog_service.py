@@ -61,15 +61,15 @@ class ArchitectureCatalogService:
             },
             {
                 "id": "agent_runtime",
-                "title": "★ Focus Domain #2 · Dual-Mode Agent Runtime & Context Strategy",
+                "title": "★ Focus Domain #2 · `langchain-ai/deepagents` Runtime & Verification Gates",
                 "file_path": "app/domains/execution/runtime.py",
-                "claude_pattern": "Dual-Mode Tool Loop · Auto-Compaction Default + Optional Context Reset Handoff",
+                "claude_pattern": "DeepAgent Graph · Antigravity Plan/Walkthrough Artifacts + Pytest & Rubric Gates",
                 "why_different": (
-                    "Direct Tool Calling과 Code Mode(`REPL`)를 단일 런타임에서 전환하며 `<think>` 추론 블록을 자동 분리합니다. "
-                    "Claude Code CLI의 기본 전략인 Auto-Compaction(`context_strategy='compaction'`)과 "
-                    "에이전트 간 인계용 Context Reset + `HandoffArtifact`(`context_strategy='reset_handoff'`)를 모두 지원합니다."
+                    "`create_deep_agent` 그래프 위에 `GuardedWorktreeBackend` 4대 격리, Antigravity 3단계 산출물 흐름"
+                    "(`implementation_plan.md` → `task.md` → `walkthrough.md` + `request_review` 승인 인터럽트), "
+                    "결정론적 `PytestGateMiddleware` 및 `RubricMiddleware` 이중 완료 게이트를 결합합니다."
                 ),
-                "ownership": "★ Focus Domain #2 · Execution (Claude Code Kick)",
+                "ownership": "★ Focus Domain #2 · Execution (`deepagents` Engine)",
             },
             {
                 "id": "evaluator_rubric",

@@ -40,14 +40,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
-        # 1. Ensure demo workspace has initial merged RepoOnboard files on first boot
-        if not (container.demo_workspace / "repo_onboard" / "service.py").exists():
-            await container.coordinator.execute_full_workflow(
-                "Build RepoOnboard: Local & Internal Git Codebase Onboarding Service"
-            )
-        # 2. Always guarantee offline bare remote fixture (`internal_origin.git`) is ready
+        # 1. Guarantee offline bare remote fixture (`internal_origin.git`) is ready without LLM calls
         container.coordinator.ensure_internal_bare_remote()
-        # 3. Always reset isolated Code Mode REPL sandbox cleanly
+        # 2. Reset isolated Code Mode REPL sandbox cleanly
         container.code_mode_service.reset_sandbox()
         yield
 

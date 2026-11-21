@@ -331,7 +331,8 @@ def test_act2_request_review_plan_approve_live_preview_and_act4_clean_review(
         assert prev.status_code == 200
         assert "sandbox allow-scripts" in prev.headers.get("content-security-policy", "")
         assert prev.headers.get("x-content-type-options") == "nosniff"
-        assert "repo_onboard/analyzer.py" in prev.text
+        assert "repo_onboard/formatting.py" in prev.text
+        assert "format_module_badge" in prev.text
         assert client.get("/api/workflow/tasks/nonexistent-task/preview").status_code == 404
         assert client.get("/api/workflow/tasks/..%2F..%2Fetc/preview").status_code == 404
 

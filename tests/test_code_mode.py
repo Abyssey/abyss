@@ -9,8 +9,10 @@ import time
 from pathlib import Path
 
 from app.domains.execution.code_mode import CodeModeExecutor, HookSpec
-from app.domains.execution.runtime import AgentRuntime
+from app.domains.execution.deepagent_backend import GuardedWorktreeBackend
+from app.domains.execution.runtime import DeepAgentRuntime
 from app.domains.guardrails.permissions import PermissionRules, split_compound_command
+from tests.helpers_llm_doubles import ScriptedDeepAgentChatModel, ai_text, ai_tool_call
 
 
 def _setup_sample_worktree(tmp_path: Path) -> tuple[Path, Path]:
@@ -170,92 +172,70 @@ def test_repl_static_review_blocks_import_and_dunder(tmp_path: Path) -> None:
     assert any("import is not allowed" in f for f in res.review.findings)
 
 
-def test_agent_runtime_with_code_mode_and_compaction_strategy(tmp_path: Path) -> None:
+def test_deepagent_runtime_with_code_mode_repl_tool(tmp_path: Path) -> None:
     main_root, wt_root = _setup_sample_worktree(tmp_path)
     cm = CodeModeExecutor(worktree_root=wt_root, main_checkout_root=main_root)
+    backend = GuardedWorktreeBackend(worktree_root=wt_root, main_checkout_root=main_root)
 
-    runtime = AgentRuntime(
-        agent_id="worker-code",
-        role="worker",
-        worktree_root=wt_root,
-        main_checkout_root=main_root,
-        worktree_branch="worktree-worker-code",
-        tools_registry={},
-        tools_schema=[],
-        code_mode=cm,
-        context_strategy="compaction",
+    model = ScriptedDeepAgentChatModel(
+        steps=[
+            ai_tool_call(
+                "run_python",
+                {
+                    "code": (
+                        'files = (await sh(\'grep -rl "def retryPolicy" src\')).lines()\n'
+                        "target = files[0]\n"
+                        'await edit(target, \'"maxAttempts": 3\', \'"maxAttempts": 5\')\n'
+                        't = await sh("pytest -q src/test_retry.py", nothrow=True)\n'
+                        '{"edited": target, "ok": t.ok}'
+                    )
+                },
+                content="<think>Code Mode REPL로 검색·수정·테스트를 한 스텝에 수행합니다.</think>",
+            ),
+            ai_text("Done in 1 REPL turn."),
+        ]
     )
 
-    step_counter = 0
-
-    def fake_llm(_messages: list[dict], tools_schema: list[dict]) -> dict:
-        nonlocal step_counter
-        step_counter += 1
-        assert len(tools_schema) == 1
-        assert tools_schema[0]["function"]["name"] == "REPL"
-        if step_counter == 1:
-            return {
-                "provider": "qwen",
-                "content": "<think>Code Mode REPL로 검색·수정·테스트를 한 스텝에 수행합니다.</think>",
-                "tool_calls": [
-                    {
-                        "id": "call_repl_1",
-                        "function": {
-                            "name": "REPL",
-                            "arguments": {
-                                "code": (
-                                    'files = (await sh(\'grep -rl "def retryPolicy" src\')).lines()\n'
-                                    "target = files[0]\n"
-                                    'await edit(target, \'"maxAttempts": 3\', \'"maxAttempts": 5\')\n'
-                                    't = await sh("pytest -q src/test_retry.py", nothrow=True)\n'
-                                    '{"edited": target, "ok": t.ok}'
-                                )
-                            },
-                        },
-                    }
-                ],
-            }
-        return {
-            "provider": "qwen",
-            "content": "Done in 1 REPL turn.",
-            "tool_calls": [],
-        }
-
-    artifact = runtime.run(
+    runtime = DeepAgentRuntime(
+        model=model,
+        backend=backend,
+        mode="repl",
+        code_mode=cm,
+        workflow="fast",
+        completion_cmd=None,
+        rubric_enabled=False,
+    )
+    res = runtime.run(
         system_prompt="You are a Code Mode worker.",
         task_prompt="Raise retryPolicy maxAttempts from 3 to 5 and run tests.",
-        llm_callable=fake_llm,
     )
 
-    assert artifact.context_strategy == "compaction"
-    assert len(artifact.tool_history) == 1
-    assert artifact.tool_history[0].tool_name == "REPL"
-    assert artifact.files_touched == ["src/retry_policy.py"]
+    assert res.passed is True
+    assert any(t.tool_name == "run_python" for t in res.turn_trace)
+    assert res.files_touched == ["src/retry_policy.py"]
+    assert '"maxAttempts": 5' in (wt_root / "src" / "retry_policy.py").read_text(encoding="utf-8")
 
 
-def test_agent_runtime_and_handoff_default_context_strategy_is_compaction() -> None:
-    import inspect
-    from app.domains.execution.runtime import HandoffArtifact
+def test_deepagent_runtime_default_workflow_and_compaction_support(tmp_path: Path) -> None:
+    main_root, wt_root = _setup_sample_worktree(tmp_path)
+    backend = GuardedWorktreeBackend(worktree_root=wt_root, main_checkout_root=main_root)
+    model = ScriptedDeepAgentChatModel(steps=[ai_text("Summary complete.")])
 
-    sig = inspect.signature(AgentRuntime.__init__)
-    assert sig.parameters["context_strategy"].default == "compaction"
+    builder_rt = DeepAgentRuntime(model=model, backend=backend, mode="builder", completion_cmd=None, rubric_enabled=False)
+    assert builder_rt.workflow == "planning"
+    assert builder_rt.plan_review in ("request_review", "always_proceed")
 
-    default_artifact = HandoffArtifact(
-        agent_id="a1",
-        role="worker",
-        worktree_branch="agent/a1",
-        summary="done",
+    runtime = DeepAgentRuntime(
+        model=model,
+        backend=backend,
+        mode="direct",
+        completion_cmd=None,
+        rubric_enabled=False,
     )
-    assert default_artifact.context_strategy == "compaction"
-
-    reset_artifact = HandoffArtifact(
-        agent_id="a2",
-        role="worker",
-        worktree_branch="agent/a2",
-        summary="done",
-        context_strategy="reset_handoff",
-    )
-    assert reset_artifact.context_strategy == "reset_handoff"
+    assert runtime.workflow == "fast"
+    res = runtime.run("System", "Summarize repo.")
+    assert res.passed is True
+    assert res.summary == "Summary complete."
 
 
 def test_code_mode_blocks_str_format_globals_secret_exfiltration(
@@ -335,29 +315,23 @@ def test_code_mode_enforces_loop_budget_inside_nested_comprehensions(tmp_path: P
     assert "budget" in res.error.lower() or "timed out" in res.error.lower()
 
 
-def test_agent_runtime_direct_mode_enforces_read_confinement_path_norm_and_ask_gate(
+def test_guarded_backend_enforces_read_confinement_path_norm_and_ask_gate(
     tmp_path: Path,
 ) -> None:
     main_root, wt_root = _setup_sample_worktree(tmp_path)
-    runtime = AgentRuntime(
-        agent_id="worker-direct",
-        role="worker",
+    backend = GuardedWorktreeBackend(
         worktree_root=wt_root,
         main_checkout_root=main_root,
-        worktree_branch="agent/worker-direct",
-        tools_registry={},
-        tools_schema=[],
-        permissions=PermissionRules.default(),
     )
 
-    assert runtime._verify_tool_isolation("read_file", {"path": "../../../.env"}).allowed is False
-    assert runtime._verify_tool_isolation("read_file", {"path": ".env"}).allowed is False
-    assert runtime._verify_tool_isolation("list_files", {"subdir": ".."}).allowed is False
-    assert runtime._verify_tool_isolation("write_file", {"path": "sub/../.env", "content": "x"}).allowed is False
-    assert runtime._verify_tool_isolation("run_command", {"command": "pip install evilpkg"}).allowed is False
-    # Dual-key alias attack: safe `subdir` paired with escaping `directory` must still be blocked
-    assert runtime._verify_tool_isolation("list_files", {"subdir": ".", "directory": "../../.."}).allowed is False
-    assert runtime._verify_tool_isolation("read_file", {"path": "src/retry_policy.py", "file_path": "../../../.env"}).allowed is False
+    assert backend.read("../../../.env").error is not None
+    assert backend.read("/.env").error is not None
+    assert backend.ls("..").error is not None
+    assert backend.write("sub/../.env", "x").error is not None
+    exec_res = backend.execute("pip install evilpkg")
+    assert exec_res.exit_code != 0
+    assert "[WORKTREE ISOLATION REFUSAL" in exec_res.output
+    assert len(backend.blocked_attempts) >= 5
 
 
 def test_code_mode_blocks_match_class_coroutine_frames_lambda_spin_and_cloud_secrets(

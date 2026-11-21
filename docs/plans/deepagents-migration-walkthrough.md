@@ -170,3 +170,24 @@ $ .venv/bin/pytest -q tests/test_coding_agent_tasks.py tests/test_internal_git.p
 $ GEMINI_ENABLED=false QWEN_ENABLED=false OPENAI_ENABLED=false .venv/bin/pytest -q
 103 passed in 67.20s (0:01:07)
 ```
+
+---
+
+## Phase 6 — 멀티에이전트 팀 & mock 완전 제거
+
+### Changes Made
+- [DELETE] `app/domains/workflow/seed_templates.py`, `app/domains/workflow/deepagents_adapter.py`, `app/domains/workflow/worktree_tools.py`: 하드코딩 데모 템플릿, 형식용 프리뷰 어댑터, 레거시 직접 도구 래퍼 완전 삭제.
+- [MODIFY] [runtime.py](../../app/domains/execution/runtime.py), [__init__.py](../../app/domains/execution/__init__.py): 레거시 자체 `for step` 루프(`AgentRuntime`, `HandoffArtifact`, `ToolCallRecord`, `ContextStrategy`)를 전면 제거하고 `DeepAgentRuntime` 단일 엔진만 유지.
+- [MODIFY] [provider_rotator.py](../../app/core/llm/provider_rotator.py), [.env.example](../../.env.example): `mock` 프로바이더, `mock_responder`, `invoke_chat`, `MOCK_ENABLED` 완전 제거. 라이브 자격증명 상태 헬퍼(`has_live_credentials()`, `active_live_label()`, `status_banner`) 및 `AGENT_RUBRIC_ENABLED=true`, `AGENT_PLAN_REVIEW=request_review` 기본값 추가.
+- [MODIFY] [coordinator.py](../../app/domains/workflow/coordinator.py): Lead `DeepAgentRuntime(mode="direct", response_format=TeamPlan)` 분해(`lead_todos`, `team_artifacts["implementation_plan"]`) → Wave별 `asyncio.gather` 병렬 Worktree Worker `DeepAgentRuntime(mode="worker", workflow="planning")` + LangChain 메일박스 도구(`send_team_message`, `read_team_messages`, `update_task_status`) → `EvaluatorRubric` 100점 머지 게이트 → 순차 `--no-ff` 머지 및 통합 `pytest` 기반 `team_artifacts["walkthrough"]` 합성으로 전면 재작성.
+- [MODIFY] [main.py](../../app/main.py), [container.py](../../app/core/container.py), [schemas.py](../../app/domains/workflow/schemas.py), [router.py](../../app/domains/workflow/router.py), [catalog_service.py](../../app/domains/workflow/catalog_service.py): 서버 기동 시 자동 워크플로 실행 제거(키 미설정 시에도 오프라인 Act 1/3 정상 부팅), `engine_mode` 필드 제거, `MultiAgentTeamCoordinator`에 `rotator.build_chat_model` 주입.
+- [MODIFY] [test_code_mode.py](../../tests/test_code_mode.py), [test_provider_rotator.py](../../tests/test_provider_rotator.py), [test_orchestrator_e2e.py](../../tests/test_orchestrator_e2e.py), [test_web_server.py](../../tests/test_web_server.py): `ScriptedDeepAgentChatModel` 기반 멀티에이전트 E2E(HTTP 503 Fail-Fast + 3-Worktree 병렬 빌드·리뷰·머지·`RepoOnboardService` 동적 검증) 및 `DeepAgentRuntime` 테스트로 전환.
+
+### Validation Results
+```text
+$ grep -rnE "mock_responder|seed_templates|deepagents_adapter|PROJECT_MAP_BUILDER_CODE|_build_worker_scripted_responder" app/domains/ app/core/ app/main.py
+(0 matches)
+
+$ GEMINI_ENABLED=false QWEN_ENABLED=false OPENAI_ENABLED=false .venv/bin/pytest -q
+104 passed in 34.55s
+```

@@ -1,36 +1,102 @@
 """
 app/domains/workflow/coordinator.py
-Agent Teams (Shared Task List + Mailbox) & 3-Worktree Parallel Coordinator.
+Multi-Agent Parallel Worktree Coordinator powered by `langchain-ai/deepagents`.
+
+Pipeline:
+  1. Lead Agent (`DeepAgentRuntime(mode="direct", response_format=TeamPlan)`):
+     Decomposes `user_goal` into 2–3 isolated `TeamTask` slices, tracks `write_todos`
+     progress, and writes a team-level `implementation_plan.md`.
+  2. Parallel Worktree Workers (`DeepAgentRuntime(mode="worker", workflow="planning")`):
+     Each worker operates inside its own locked Git worktree (`.abyss/worktrees/<worker_id>`)
+     behind `GuardedWorktreeBackend`, exchanges contracts via Agent Teams Mailbox tools
+     (`send_team_message`, `read_team_messages`, `update_task_status`), and produces its
+     own `implementation_plan.md`, `task.md`, and stamped `walkthrough.md`.
+  3. Independent Reviewer Gate (`EvaluatorRubric`):
+     Scores each worker branch on automated pytest, diff substance, symbol contracts, and hygiene.
+  4. Lead Sequential Merge & Team Walkthrough:
+     Merges approved branches onto `main` (`git merge --no-ff`), runs integration `pytest`,
+     pushes `main` when an internal remote is configured, and synthesizes team `walkthrough.md`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+
+from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import BaseModel, Field
 
 from app.core.config import AppSettings
 from app.core.llm.provider_rotator import LLMProviderRotator
-from app.domains.execution.runtime import AgentRuntime, HandoffArtifact
-from app.domains.guardrails.permissions import PermissionRules
-from app.domains.workflow.deepagents_adapter import create_worktree_deep_agent
-from app.domains.workflow.evaluator import EvaluatorRubric, ReviewDecision
-from app.domains.workflow.seed_templates import (
-    WORKER_1_ANALYZER_CODE,
-    WORKER_1_TEST_CODE,
-    WORKER_2_TEST_CODE,
-    WORKER_2_TUTOR_CODE,
-    WORKER_3_TEST_CODE,
-    WORKER_3_VIEW_CODE,
+from app.domains.execution.deepagent_backend import (
+    GuardedWorktreeBackend,
+    ReadOnlyGuardedBackend,
+    _safe_env,
+    collect_env_secrets,
 )
+from app.domains.execution.runtime import DeepAgentResult, DeepAgentRuntime
+from app.domains.workflow.evaluator import EvaluatorRubric, ReviewDecision
 from app.domains.workflow.worktree_adapter import GitWorktreeManager
-from app.domains.workflow.worktree_tools import build_agent_tools, build_safe_subprocess_env
+
+
+class TeamTaskSpec(BaseModel):
+    """Single parallelizable slice emitted by the Lead `DeepAgentRuntime`."""
+
+    task_id: str = Field(default="", description="Identifier such as TASK-1, TASK-2, TASK-3.")
+    title: str = Field(description="Concise engineering title of the slice.")
+    description: str = Field(description="Actionable implementation specification for the worker.")
+    assigned_to: str = Field(
+        default="",
+        description="Worker roster ID (e.g., worker-analyzer, worker-tutor, worker-web).",
+    )
+    target_files: list[str] = Field(
+        default_factory=list,
+        description="Relative file paths inside the worktree owned by this worker (code + tests).",
+    )
+    required_symbols: list[str] = Field(
+        default_factory=list,
+        description="Key class/function names that must appear in the diff.",
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description="Optional upstream task_ids whose branches must merge before this worker runs.",
+    )
+
+
+class TeamPlan(BaseModel):
+    """Structured output returned by the Lead `DeepAgentRuntime`."""
+
+    summary: str = Field(description="Architectural summary of how the goal is split across workers.")
+    tasks: list[TeamTaskSpec] = Field(
+        min_length=1,
+        max_length=4,
+        description="2–3 isolated worktree tasks with non-overlapping target_files.",
+    )
+
+
+class _SendMailboxInput(BaseModel):
+    recipient: str = Field(description="Target teammate ID (e.g., worker-tutor, worker-web, lead).")
+    message: str = Field(description="Schema contract or coordination note to deliver.")
+
+
+class _EmptyToolInput(BaseModel):
+    pass
+
+
+class _UpdateTaskStatusInput(BaseModel):
+    task_id: str = Field(description="Shared task board ID (e.g., TASK-1).")
+    status: str = Field(description="New status (in_progress, in_review).")
+    note: str = Field(default="", description="Short progress note.")
 
 
 @dataclass
@@ -45,7 +111,7 @@ class TeamTask:
     target_files: list[str]
     required_symbols: list[str]
     depends_on: list[str] = field(default_factory=list)
-    status: str = "pending"  # "pending" | "in_progress" | "in_review" | "approved" | "merged" | "rejected"
+    status: str = "pending"
     review_score: int = 0
     commit_hash: str = ""
     provider_used: str = ""
@@ -87,18 +153,99 @@ class MailboxMessage:
         }
 
 
+_DEFAULT_WORKER_ROSTER = ("worker-analyzer", "worker-tutor", "worker-web")
+
+
+def _clean_ephemeral_bytecode(worktree_root: Path) -> None:
+    for cache_dir in list(worktree_root.rglob("__pycache__")) + list(
+        worktree_root.rglob(".pytest_cache")
+    ):
+        if ".git" not in cache_dir.parts:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+    for pyc in list(worktree_root.rglob("*.pyc")) + list(worktree_root.rglob("*.pyo")):
+        if ".git" not in pyc.parts:
+            pyc.unlink(missing_ok=True)
+
+
+def _render_team_plan_markdown(goal: str, summary: str, tasks: list[TeamTask]) -> str:
+    lines = [
+        "# Team Implementation Plan",
+        "",
+        "## Goal",
+        goal,
+        "",
+        "## Architectural Decomposition",
+        summary or "Parallel worktree decomposition produced by Lead DeepAgent.",
+        "",
+        "## Assigned Worktree Slices",
+    ]
+    for t in tasks:
+        files_str = ", ".join(f"`{f}`" for f in t.target_files) or "(unscoped)"
+        deps_str = f" (depends on: {', '.join(t.depends_on)})" if t.depends_on else ""
+        lines.append(f"- **{t.task_id} · `{t.assigned_to}`** (`{t.worktree_branch}`){deps_str}: {t.title} — {files_str}")
+    lines.extend(
+        [
+            "",
+            "## Verification Plan",
+            "- Per-worker `PytestGateMiddleware` + `RubricMiddleware` inside isolated Git worktrees.",
+            "- Independent `EvaluatorRubric` 100-point merge gate + post-merge integration `pytest`.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _render_team_walkthrough_markdown(
+    goal: str,
+    tasks: list[TeamTask],
+    handoffs: dict[str, dict[str, Any]],
+    integration_passed: bool,
+    integration_output: str,
+) -> str:
+    lines = [
+        "# Team Walkthrough",
+        "",
+        f"## Goal\n{goal}",
+        "",
+        "## Changes Made Across Worktrees",
+    ]
+    for t in tasks:
+        ho = handoffs.get(t.assigned_to, {})
+        touched = ", ".join(f"`{f}`" for f in ho.get("files_touched", [])) or ", ".join(
+            f"`{f}`" for f in t.target_files
+        )
+        lines.append(
+            f"- **{t.task_id} (`{t.assigned_to}` -> `{t.status}`, score={t.review_score}/100)**: "
+            f"{t.title} — files: {touched}"
+        )
+        wt_doc = str((ho.get("artifacts") or {}).get("walkthrough", "")).strip()
+        if wt_doc:
+            first_para = next(
+                (
+                    ln.strip()
+                    for ln in wt_doc.splitlines()
+                    if ln.strip() and not ln.strip().startswith(("#", "<!--"))
+                ),
+                "",
+            )
+            if first_para:
+                lines.append(f"  - Worker note: {first_para[:200]}")
+
+    lines.extend(
+        [
+            "",
+            "## Validation Results",
+            f"- Integration `pytest` on merged `main`: `{'PASSED' if integration_passed else 'FAILED'}`",
+            "```text",
+            (integration_output.strip()[-1500:] or "(no output)"),
+            "```",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 class MultiAgentTeamCoordinator:
     """
-    멀티 에이전트 3-Worktree 병렬 개발 오케스트레이터:
-    - Lead Agent: 태스크 분해 및 공유 태스크 보드(`.abyss/tasks.json`) 초기화
-    - 3 Worktree Workers (`worker-analyzer`, `worker-tutor`, `worker-web`):
-      각자 `.abyss/worktrees/<worker_id>` 독립 브랜치에서 병렬 개발,
-      `WorktreeIsolationPolicy` 4대 보안 검증 통과,
-      `.abyss/mailbox/*.jsonl`로 JSON 스키마 합의 및 커밋
-    - Reviewer Agent (`EvaluatorRubric`):
-      각 Worktree 브랜치의 `git diff` 및 `pytest`를 독립 실행하여 채점/승인
-    - Lead Agent Merge:
-      승인된 3개 Worktree 브랜치를 `main`에 순차 머지(`git merge --no-ff`)하고 통합 테스트 및 원격 푸시 수행
+    멀티 에이전트 병렬 Worktree 오케스트레이터 (`langchain-ai/deepagents` 단일 엔진).
     """
 
     def __init__(
@@ -107,6 +254,7 @@ class MultiAgentTeamCoordinator:
         rotator: LLMProviderRotator,
         bare_remote_path: str | Path | None = None,
         settings: AppSettings | None = None,
+        model_factory: Callable[[str, str], Any] | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.bare_remote_path = Path(bare_remote_path).resolve() if bare_remote_path else None
@@ -115,20 +263,26 @@ class MultiAgentTeamCoordinator:
         self.mailbox_dir = self.abyss_dir / "mailbox"
         self.tasks_file = self.abyss_dir / "tasks.json"
         self.rotator = rotator
+        self.model_factory: Callable[[str, str], Any] = model_factory or self.rotator.build_chat_model
         self.rubric = EvaluatorRubric()
         self.worktree_mgr = GitWorktreeManager(self.workspace_root)
 
         self.tasks: dict[str, TeamTask] = {}
+        self.lead_todos: list[dict[str, str]] = []
+        self.team_artifacts: dict[str, str] = {
+            "implementation_plan": "",
+            "walkthrough": "",
+        }
         self.mailbox_log: list[MailboxMessage] = []
         self.event_stream: list[dict[str, Any]] = []
         self.handoffs: dict[str, dict[str, Any]] = {}
         self.reviews: dict[str, dict[str, Any]] = {}
         self.merge_results: list[dict[str, Any]] = []
         self.last_push_result: dict[str, Any] | None = None
-        self.engine_mode: str = "agent_runtime"  # "agent_runtime" | "deepagents"
         self.is_running: bool = False
         self.last_status: str = "idle"
         self._event_lock = threading.Lock()
+        self._mailbox_lock = threading.Lock()
         self._listeners: list[
             tuple[asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop | None]
         ] = []
@@ -137,6 +291,16 @@ class MultiAgentTeamCoordinator:
         if self.bare_remote_path is not None:
             self.ensure_internal_bare_remote()
 
+    def _resolve_model(self, agent_id: str, role: str) -> tuple[Any, str, list[Any]]:
+        selection = self.model_factory(agent_id, role)
+        if hasattr(selection, "model") and hasattr(selection, "label"):
+            mw_fn = getattr(selection, "middleware", None)
+            extra_mw = list(mw_fn()) if callable(mw_fn) else []
+            return selection.model, str(selection.label), extra_mw
+        if isinstance(selection, tuple) and len(selection) == 2:
+            return selection[0], str(selection[1]), []
+        return selection, getattr(selection, "model_name", type(selection).__name__), []
+
     def ensure_internal_bare_remote(self) -> str:
         """오프라인 데모 및 테스트용 내부 Bare 원격 저장소를 멱등 초기화합니다."""
         target_bare = self.bare_remote_path or (self.workspace_root.parent / "internal_origin.git")
@@ -144,7 +308,7 @@ class MultiAgentTeamCoordinator:
         return self.worktree_mgr.ensure_internal_bare_remote(self.bare_remote_path)
 
     def _ensure_base_package(self) -> None:
-        """데모 워크스페이스에 기본 패키지 초기화 파일과 .worktreeinclude를 준비합니다."""
+        """데모 워크스페이스에 기본 패키지 스켈레톤(3+ 파일)과 `.worktreeinclude`를 준비합니다."""
         self.abyss_dir.mkdir(parents=True, exist_ok=True)
         self.mailbox_dir.mkdir(parents=True, exist_ok=True)
 
@@ -161,18 +325,50 @@ class MultiAgentTeamCoordinator:
 
         pkg_dir = self.workspace_root / "repo_onboard"
         pkg_dir.mkdir(parents=True, exist_ok=True)
-        init_file = pkg_dir / "__init__.py"
-        if not init_file.exists():
-            init_file.write_text(
-                '"""RepoOnboard: Local & Internal Git Codebase Onboarding & Socratic Tutor."""\n',
-                encoding="utf-8",
-            )
+        starter_files = {
+            pkg_dir / "__init__.py": (
+                '"""RepoOnboard: Local & Internal Git Codebase Onboarding & Socratic Tutor."""\n'
+            ),
+            pkg_dir / "models.py": (
+                '"""Shared domain data structures for RepoOnboard."""\n\n'
+                "from dataclasses import dataclass, field\n\n\n"
+                "@dataclass\n"
+                "class ModuleNode:\n"
+                "    module_id: str\n"
+                "    file_path: str\n"
+                "    imports: list[str] = field(default_factory=list)\n"
+            ),
+            pkg_dir / "formatting.py": (
+                '"""Formatting helpers for onboarding summaries."""\n\n\n'
+                "def format_module_badge(module_id: str, line_count: int) -> str:\n"
+                '    return f"{module_id} ({max(0, line_count)} lines)"\n'
+            ),
+        }
+        for path, content in starter_files.items():
+            if not path.exists():
+                path.write_text(content, encoding="utf-8")
 
         tests_dir = self.workspace_root / "tests"
         tests_dir.mkdir(parents=True, exist_ok=True)
+        starter_test = tests_dir / "test_formatting.py"
+        if not starter_test.exists():
+            starter_test.write_text(
+                "from repo_onboard.formatting import format_module_badge\n\n\n"
+                "def test_format_module_badge() -> None:\n"
+                '    assert format_module_badge("pkg.core", 42) == "pkg.core (42 lines)"\n',
+                encoding="utf-8",
+            )
 
         self.worktree_mgr._run_git(
-            ["add", ".gitignore", "repo_onboard/__init__.py", ".worktreeinclude"]
+            [
+                "add",
+                ".gitignore",
+                ".worktreeinclude",
+                "repo_onboard/__init__.py",
+                "repo_onboard/models.py",
+                "repo_onboard/formatting.py",
+                "tests/test_formatting.py",
+            ]
         )
         status = self.worktree_mgr._run_git(["status", "--porcelain"]).stdout.strip()
         if status:
@@ -181,19 +377,24 @@ class MultiAgentTeamCoordinator:
             )
 
     def _reset_generated_targets_if_present(self, target_files: list[str]) -> None:
-        """
-        Reset previously merged demo target files via a forward commit before creating
-        fresh worktrees so repeat `POST /api/workflow/run` invocations always produce
-        real branch diffs, full 100/100 evaluations, 3 `--no-ff` merges, and fast-forward push.
-        """
-        existing = [f for f in target_files if (self.workspace_root / f).exists()]
+        protected = {
+            "repo_onboard/__init__.py",
+            "repo_onboard/models.py",
+            "repo_onboard/formatting.py",
+            "tests/test_formatting.py",
+        }
+        existing = [
+            f
+            for f in target_files
+            if f not in protected and (self.workspace_root / f).exists()
+        ]
         if not existing:
             return
         self.worktree_mgr._run_git(["rm", "-f", "--ignore-unmatch", "--", *existing])
         status = self.worktree_mgr._run_git(["status", "--porcelain"]).stdout.strip()
         if status:
             self.worktree_mgr._run_git(
-                ["commit", "-m", "chore: reset demo targets for fresh 3-worktree parallel build"]
+                ["commit", "-m", "chore: reset target files for fresh parallel worktree build"]
             )
 
     def subscribe_events(self) -> asyncio.Queue[dict[str, Any]]:
@@ -233,17 +434,18 @@ class MultiAgentTeamCoordinator:
         self.tasks_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def send_mailbox_message(self, sender: str, recipient: str, content: str) -> str:
-        msg = MailboxMessage(
-            msg_id=f"msg-{len(self.mailbox_log) + 1:03d}",
-            timestamp=time.time(),
-            sender=sender,
-            recipient=recipient,
-            content=content,
-        )
-        self.mailbox_log.append(msg)
-        inbox_file = self.mailbox_dir / f"{recipient}.jsonl"
-        with inbox_file.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(msg.to_dict(), ensure_ascii=False) + "\n")
+        with self._mailbox_lock:
+            msg = MailboxMessage(
+                msg_id=f"msg-{len(self.mailbox_log) + 1:03d}",
+                timestamp=time.time(),
+                sender=sender,
+                recipient=recipient,
+                content=content,
+            )
+            self.mailbox_log.append(msg)
+            inbox_file = self.mailbox_dir / f"{recipient}.jsonl"
+            with inbox_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(msg.to_dict(), ensure_ascii=False) + "\n")
 
         self.emit_event(
             {
@@ -257,10 +459,11 @@ class MultiAgentTeamCoordinator:
         return f"Message delivered to {recipient} ({msg.msg_id})."
 
     def read_mailbox_messages(self, agent_id: str) -> str:
-        inbox_file = self.mailbox_dir / f"{agent_id}.jsonl"
-        if not inbox_file.exists():
-            return "No messages in inbox."
-        lines = inbox_file.read_text(encoding="utf-8").splitlines()
+        with self._mailbox_lock:
+            inbox_file = self.mailbox_dir / f"{agent_id}.jsonl"
+            if not inbox_file.exists():
+                return "No messages in inbox."
+            lines = inbox_file.read_text(encoding="utf-8").splitlines()
         parsed = [json.loads(line) for line in lines if line.strip()]
         return "\n".join(f"[{m['sender']} -> {m['recipient']}]: {m['content']}" for m in parsed)
 
@@ -279,129 +482,119 @@ class MultiAgentTeamCoordinator:
             )
         return f"Task {task_id} status updated to '{status}'."
 
-    def _build_worker_scripted_responder(
-        self,
-        worker_id: str,
-        code_path: str,
-        code_content: str,
-        test_path: str,
-        test_content: str,
-        peer_recipient: str,
-        schema_message: str,
-        demonstrate_guard_block: bool = False,
-    ) -> Callable[[list[dict[str, Any]], list[dict[str, Any]]], dict[str, Any]]:
-        turn_idx = 0
-
-        def responder(messages: list[dict[str, Any]], tools_schema: list[dict[str, Any]]) -> dict[str, Any]:
-            nonlocal turn_idx
-            turn_idx += 1
-
-            if turn_idx == 1 and demonstrate_guard_block:
-                return {
-                    "content": (
-                        f"<think>[{worker_id}] 먼저 메인 체크아웃의 외부 git 상태를 직접 조회해 보겠습니다.</think>\n"
-                        "Checking repository state before writing module..."
-                    ),
-                    "tool_calls": [
-                        {
-                            "id": f"call_{worker_id}_guard_demo",
-                            "type": "function",
-                            "function": {
-                                "name": "run_command",
-                                "arguments": json.dumps(
-                                    {"command": f"git -C {self.workspace_root} status"}
-                                ),
-                            },
-                        }
-                    ],
-                }
-
-            step_offset = 1 if demonstrate_guard_block else 0
-
-            if turn_idx == 1 + step_offset:
-                return {
-                    "content": (
-                        f"<think>[{worker_id}] Worktree 격리 정책에 맞춰 현재 할당된 Worktree 내부 경로(`{code_path}`, `{test_path}`)에 "
-                        "구현 코드와 단위 테스트를 작성합니다.</think>\n"
-                        f"Implementing `{code_path}` and unit tests `{test_path}` in isolated worktree."
-                    ),
-                    "tool_calls": [
-                        {
-                            "id": f"call_{worker_id}_write_code",
-                            "type": "function",
-                            "function": {
-                                "name": "write_file",
-                                "arguments": json.dumps(
-                                    {"path": code_path, "content": code_content}
-                                ),
-                            },
-                        },
-                        {
-                            "id": f"call_{worker_id}_write_test",
-                            "type": "function",
-                            "function": {
-                                "name": "write_file",
-                                "arguments": json.dumps(
-                                    {"path": test_path, "content": test_content}
-                                ),
-                            },
-                        },
-                    ],
-                }
-
-            if turn_idx == 2 + step_offset:
-                return {
-                    "content": (
-                        f"<think>[{worker_id}] 동료 에이전트(`{peer_recipient}`)에게 데이터 계약(JSON Schema)을 "
-                        "메일박스로 공유하고, Worktree 내에서 pytest를 실행해 검증합니다.</think>\n"
-                        f"Syncing contract via Agent Mailbox with `{peer_recipient}` and running pytest."
-                    ),
-                    "tool_calls": [
-                        {
-                            "id": f"call_{worker_id}_mailbox",
-                            "type": "function",
-                            "function": {
-                                "name": "send_team_message",
-                                "arguments": json.dumps(
-                                    {"recipient": peer_recipient, "message": schema_message}
-                                ),
-                            },
-                        },
-                        {
-                            "id": f"call_{worker_id}_pytest",
-                            "type": "function",
-                            "function": {
-                                "name": "run_command",
-                                "arguments": json.dumps(
-                                    {"command": f"pytest -p no:cacheprovider {test_path} -q"}
-                                ),
-                            },
-                        },
-                    ],
-                }
-
-            return {
-                "content": (
-                    f"<think>[{worker_id}] 모든 단위 테스트가 통과되었고 메일박스 스키마 공유도 완료했습니다. "
-                    "독립 Reviewer 인계를 위해 구조화된 Handoff 요약을 반환합니다.</think>\n"
-                    f"Completed `{code_path}` implementation and verified `{test_path}` in isolated worktree."
+    def _build_mailbox_tools(self, worker_id: str) -> list[BaseTool]:
+        """LangChain tools exposing the Agent Teams Mailbox & Shared Task Board to a worker."""
+        return [
+            StructuredTool.from_function(
+                name="send_team_message",
+                description="Send an asynchronous contract/coordination message to a teammate or lead via Agent Teams Mailbox.",
+                func=lambda recipient, message: self.send_mailbox_message(
+                    worker_id, recipient, message
                 ),
-                "tool_calls": [],
+                args_schema=_SendMailboxInput,
+                infer_schema=False,
+            ),
+            StructuredTool.from_function(
+                name="read_team_messages",
+                description="Read incoming messages in your Agent Teams Mailbox.",
+                func=lambda: self.read_mailbox_messages(worker_id),
+                args_schema=_EmptyToolInput,
+                infer_schema=False,
+            ),
+            StructuredTool.from_function(
+                name="update_task_status",
+                description="Update your task status on the Shared Task Board (in_progress, in_review).",
+                func=self.update_task_status,
+                args_schema=_UpdateTaskStatusInput,
+                infer_schema=False,
+            ),
+        ]
+
+    def _run_lead_planner_sync(self, user_goal: str) -> tuple[list[TeamTask], str]:
+        lead_model, lead_label, lead_mw = self._resolve_model("lead", "lead")
+        ro_backend = ReadOnlyGuardedBackend(
+            worktree_root=self.workspace_root,
+            main_checkout_root=self.workspace_root,
+            secrets=collect_env_secrets(),
+        )
+        lead_runtime = DeepAgentRuntime(
+            model=lead_model,
+            backend=ro_backend,
+            mode="direct",
+            workflow="fast",
+            completion_cmd=None,
+            rubric_enabled=False,
+            subagents=False,
+            response_format=TeamPlan,
+            extra_middleware=lead_mw,
+            agent_id="lead",
+            provider_label=lead_label,
+            event_callback=self.emit_event,
+        )
+        system_prompt = (
+            "You are the Lead Architect of an autonomous coding team. "
+            "Inspect the repository if needed, track decomposition steps with `write_todos`, "
+            "and return a `TeamPlan` splitting the user's goal into 2–3 isolated Git worktree tasks "
+            "with non-overlapping `target_files` (each including an implementation `.py` file and a "
+            "`tests/test_*.py` file) and explicit `required_symbols`."
+        )
+        lead_res = lead_runtime.run(system_prompt, f"Decompose team goal: {user_goal}")
+        self.lead_todos = list(lead_res.todos)
+
+        raw_plan = lead_res.structured_response
+        if isinstance(raw_plan, dict):
+            plan = TeamPlan.model_validate(raw_plan)
+        elif isinstance(raw_plan, TeamPlan):
+            plan = raw_plan
+        else:
+            msg = "Lead DeepAgent did not produce a valid structured `TeamPlan`."
+            raise RuntimeError(msg)
+
+        tasks: list[TeamTask] = []
+        used_workers: set[str] = set()
+        for idx, spec in enumerate(plan.tasks, start=1):
+            tid = spec.task_id.strip() or f"TASK-{idx}"
+            raw_worker = re.sub(r"[^a-z0-9_-]", "", spec.assigned_to.strip().lower())
+            if not raw_worker or raw_worker in used_workers:
+                raw_worker = (
+                    _DEFAULT_WORKER_ROSTER[idx - 1]
+                    if idx - 1 < len(_DEFAULT_WORKER_ROSTER)
+                    else f"worker-{idx}"
+                )
+            used_workers.add(raw_worker)
+            tasks.append(
+                TeamTask(
+                    task_id=tid,
+                    title=spec.title.strip(),
+                    description=spec.description.strip(),
+                    assigned_to=raw_worker,
+                    worktree_branch=f"worktree-{raw_worker}",
+                    target_files=list(spec.target_files),
+                    required_symbols=list(spec.required_symbols),
+                    depends_on=list(spec.depends_on),
+                )
+            )
+
+        plan_md = _render_team_plan_markdown(user_goal, plan.summary, tasks)
+        self.team_artifacts["implementation_plan"] = plan_md
+        team_plan_path = self.abyss_dir / "team_implementation_plan.md"
+        team_plan_path.write_text(plan_md, encoding="utf-8")
+
+        self.emit_event(
+            {
+                "agent_id": "lead",
+                "role": "lead",
+                "event_type": "lead_planned",
+                "provider": lead_label,
+                "goal": user_goal,
+                "tasks_count": len(tasks),
+                "todos": list(self.lead_todos),
+                "message": plan.summary,
             }
+        )
+        return tasks, plan.summary
 
-        return responder
-
-    async def _run_single_worker(
-        self,
-        task: TeamTask,
-        code_path: str,
-        code_content: str,
-        test_path: str,
-        test_content: str,
-        peer_recipient: str,
-        schema_message: str,
-        demonstrate_guard_block: bool = False,
-    ) -> HandoffArtifact:
+    def _run_single_worker_sync(self, task: TeamTask, peers: list[str]) -> DeepAgentResult:
         worker_id = task.assigned_to
         wt_info = self.worktree_mgr.worktrees[worker_id]
         task.status = "in_progress"
@@ -418,95 +611,106 @@ class MultiAgentTeamCoordinator:
             }
         )
 
-        registry, schemas = build_agent_tools(
+        worker_model, worker_label, worker_mw = self._resolve_model(worker_id, worker_id)
+        artifacts_dir = (
+            (self.settings.task_runs_dir if self.settings else self.abyss_dir / "runs")
+            / f"team-{worker_id}"
+            / "artifacts"
+        ).resolve()
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        backend = GuardedWorktreeBackend(
             worktree_root=wt_info.worktree_path,
-            agent_id=worker_id,
-            send_mailbox_fn=self.send_mailbox_message,
-            read_mailbox_fn=self.read_mailbox_messages,
-            update_task_fn=self.update_task_status,
             main_checkout_root=self.workspace_root,
+            secrets=collect_env_secrets(),
+            on_block=lambda attempt: self.emit_event(
+                {
+                    "agent_id": worker_id,
+                    "role": "worker",
+                    "branch": wt_info.branch_name,
+                    "event_type": "isolation_blocked",
+                    "operation": attempt.operation,
+                    "target": attempt.target,
+                    "check_name": attempt.check_name,
+                    "reason": attempt.reason,
+                }
+            ),
         )
 
-        runtime = AgentRuntime(
+        test_targets = [f for f in task.target_files if f.startswith("tests/") and f.endswith(".py")]
+        completion_cmd = (
+            f"pytest -q -p no:cacheprovider {' '.join(test_targets)}"
+            if test_targets
+            else "pytest -q -p no:cacheprovider"
+        )
+        rubric = (
+            f"1) Implement `{task.title}` in {', '.join(task.target_files) or 'the worktree'} "
+            f"including symbols {', '.join(task.required_symbols) or '(as specified)'}. "
+            "2) Share interface/contract updates with teammates via `send_team_message`. "
+            "3) Pass unit tests cleanly."
+        )
+
+        runtime = DeepAgentRuntime(
+            model=worker_model,
+            backend=backend,
+            mode="worker",
+            workflow="planning",
+            plan_review="always_proceed",
+            artifacts_dir=artifacts_dir,
+            completion_cmd=completion_cmd,
+            rubric=rubric,
+            extra_tools=self._build_mailbox_tools(worker_id),
+            extra_middleware=worker_mw,
             agent_id=worker_id,
-            role="worker",
-            worktree_root=wt_info.worktree_path,
-            main_checkout_root=self.workspace_root,
-            worktree_branch=wt_info.branch_name,
-            tools_registry=registry,
-            tools_schema=schemas,
-            max_steps=8,
+            provider_label=worker_label,
             event_callback=self.emit_event,
-            context_strategy="reset_handoff",
-            permissions=PermissionRules.default(),
         )
 
-        scripted_responder = self._build_worker_scripted_responder(
-            worker_id=worker_id,
-            code_path=code_path,
-            code_content=code_content,
-            test_path=test_path,
-            test_content=test_content,
-            peer_recipient=peer_recipient,
-            schema_message=schema_message,
-            demonstrate_guard_block=demonstrate_guard_block,
+        system_prompt = (
+            f"You are `{worker_id}` working inside isolated Git worktree branch `{wt_info.branch_name}`.\n"
+            f"Teammates on the board: {', '.join(peers) or 'lead'}.\n"
+            "Write `/artifacts/implementation_plan.md` first, implement your assigned files & unit tests, "
+            "exchange schema contracts via `send_team_message` / `read_team_messages`, and finish with "
+            "`/artifacts/walkthrough.md`."
+        )
+        task_prompt = (
+            f"Task ID: {task.task_id}\n"
+            f"Title: {task.title}\n"
+            f"Target files: {', '.join(task.target_files)}\n"
+            f"Required symbols: {', '.join(task.required_symbols)}\n\n"
+            f"Specification:\n{task.description}"
         )
 
-        def llm_bridge(
-            messages: list[dict[str, Any]], tools_schema: list[dict[str, Any]]
-        ) -> dict[str, Any]:
-            step_reply = scripted_responder(messages, tools_schema)
-            rot_res = self.rotator.invoke_chat(
-                agent_id=worker_id,
-                role=worker_id,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a concise coding subagent working in an isolated git worktree.",
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Briefly state your next engineering action for {task.title} in 1 sentence.",
-                    },
-                ],
-                tools_schema=None,
-                mock_responder=lambda _m, _t: step_reply,
-            )
-            provider_tag = rot_res.get("provider", "mock:simulator")
-            live_note = (rot_res.get("content") or "").strip()
-            merged_content = step_reply["content"]
-            if live_note and live_note not in merged_content and not provider_tag.startswith("mock:"):
-                merged_content = f"<think>[Live LLM ({provider_tag})]: {live_note}</think>\n{merged_content}"
-            return {
-                "content": merged_content,
-                "tool_calls": step_reply["tool_calls"],
-                "provider": provider_tag,
-            }
+        res = runtime.run(system_prompt, task_prompt, thread_id=f"team-{worker_id}")
+        commit_hash = ""
+        if res.passed:
+            _clean_ephemeral_bytecode(wt_info.worktree_path)
+            wt_body = res.artifacts.get("walkthrough", "").strip()
+            commit_msg = f"feat({worker_id}): {task.title[:60]}"
+            if wt_body:
+                clean_lines = [
+                    ln
+                    for ln in wt_body.splitlines()
+                    if not ln.strip().startswith("<!-- abyss:verified-gate:")
+                ]
+                commit_msg = f"{commit_msg}\n\n" + "\n".join(clean_lines).strip()[:1500]
+            commit_hash = self.worktree_mgr.commit_worktree_changes(worker_id, commit_msg)
 
-        handoff = await asyncio.to_thread(
-            runtime.run,
-            system_prompt=f"You are {worker_id} isolated in git worktree {wt_info.worktree_path}.",
-            task_prompt=task.description,
-            llm_callable=llm_bridge,
-        )
-
-        commit_hash = await asyncio.to_thread(
-            self.worktree_mgr.commit_worktree_changes,
-            worker_id,
-            f"feat({worker_id}): implement {task.title}",
-        )
         task.commit_hash = commit_hash
-        task.provider_used = handoff.provider_used
-        task.status = "in_review"
+        task.provider_used = worker_label
+        task.status = "in_review" if res.passed else "rejected"
         self._save_tasks()
-        self.handoffs[worker_id] = handoff.to_dict()
-
-        return handoff
+        self.handoffs[worker_id] = {
+            **res.to_dict(),
+            "agent_id": worker_id,
+            "worktree_branch": wt_info.branch_name,
+        }
+        return res
 
     async def execute_full_workflow(
         self, user_goal: str = "Build RepoOnboard: Local & Internal Git Codebase Onboarding Service"
     ) -> dict[str, Any]:
-        """4단계 멀티 에이전트 병렬 Worktree 파이프라인을 실행합니다."""
+        """Lead 분해 → 격리 Worktree 병렬 Worker 실행 → 독립 루브릭 리뷰 → 순차 머지 & 팀 Walkthrough."""
         self.is_running = True
         self.last_status = "running"
         self.event_stream.clear()
@@ -514,80 +718,25 @@ class MultiAgentTeamCoordinator:
         self.handoffs.clear()
         self.reviews.clear()
         self.merge_results.clear()
+        self.lead_todos = []
+        self.team_artifacts = {"implementation_plan": "", "walkthrough": ""}
 
         try:
-            lead_rot = self.rotator.invoke_chat(
-                agent_id="lead",
-                role="lead",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"Decompose '{user_goal}' into 3 parallel git worktree tasks in 1 short sentence.",
-                    }
-                ],
-                mock_responder=lambda _m, _t: {
-                    "content": (
-                        "<think>[Lead Agent] 충돌 없이 병렬 개발하기 위해 "
-                        "① AST/Archify 분석기(worker-analyzer), ② 소크라테스 문답 튜터(worker-tutor), "
-                        "③ 통합 온보딩 서비스(worker-web) 3개 Worktree로 분리합니다.</think>\n"
-                        "Decomposed into 3 isolated git worktree tasks with mailbox schema contracts."
-                    ),
-                    "tool_calls": [],
-                },
+            # Stage 1: Lead `DeepAgentRuntime` decomposes user_goal into 2–3 `TeamTask`s
+            # (Fail-Fast: raises `LLMConfigurationError` -> HTTP 503 if unconfigured!)
+            task_defs, _lead_summary = await asyncio.to_thread(
+                self._run_lead_planner_sync, user_goal
             )
-            self.emit_event(
-                {
-                    "agent_id": "lead",
-                    "role": "lead",
-                    "event_type": "lead_planned",
-                    "provider": lead_rot.get("provider", ""),
-                    "goal": user_goal,
-                    "message": lead_rot.get("content", ""),
-                }
-            )
-
-            task_defs = [
-                TeamTask(
-                    task_id="TASK-1",
-                    title="AST & Archify Graph Analyzer (repo_onboard/analyzer.py)",
-                    description="Implement RepoAnalyzer to parse repository AST and emit archify IR graph + Mermaid.",
-                    assigned_to="worker-analyzer",
-                    worktree_branch="worktree-worker-analyzer",
-                    target_files=["repo_onboard/analyzer.py", "tests/test_analyzer.py"],
-                    required_symbols=["class RepoAnalyzer", "def analyze_target", "archify_graph"],
-                ),
-                TeamTask(
-                    task_id="TASK-2",
-                    title="Socratic Onboarding Tutor (repo_onboard/onboarding_tutor.py)",
-                    description="Implement SocraticOnboardingTutor for onboarding brief and 3-stage Socratic Q&A.",
-                    assigned_to="worker-tutor",
-                    worktree_branch="worktree-worker-tutor",
-                    target_files=["repo_onboard/onboarding_tutor.py", "tests/test_onboarding_tutor.py"],
-                    required_symbols=["class SocraticOnboardingTutor", "def build_onboarding_package", "def evaluate_answer"],
-                ),
-                TeamTask(
-                    task_id="TASK-3",
-                    title="Unified RepoOnboard Service (repo_onboard/service.py)",
-                    description="Integrate RepoAnalyzer and SocraticOnboardingTutor into RepoOnboardService.",
-                    assigned_to="worker-web",
-                    worktree_branch="worktree-worker-web",
-                    target_files=["repo_onboard/service.py", "tests/test_service.py"],
-                    required_symbols=["class RepoOnboardService", "def onboard_repository", "def check_socratic_answer"],
-                    depends_on=["TASK-1", "TASK-2"],
-                ),
-            ]
-
             self.tasks = {t.task_id: t for t in task_defs}
             self._save_tasks()
 
-            # Ensure repeat workflow runs start from a clean target baseline on `main`
-            # (forward commit preserves history and keeps `git push origin main` fast-forwardable).
             self._reset_generated_targets_if_present(
                 [fpath for t in task_defs for fpath in t.target_files]
             )
 
             for t in task_defs:
                 wt = self.worktree_mgr.create_worktree(t.assigned_to)
+                t.worktree_branch = wt.branch_name
                 self.emit_event(
                     {
                         "agent_id": "lead",
@@ -599,70 +748,66 @@ class MultiAgentTeamCoordinator:
                         "locked": wt.locked,
                     }
                 )
+            self._save_tasks()
 
+            all_worker_ids = [t.assigned_to for t in task_defs]
+            wave_1 = [t for t in task_defs if not t.depends_on]
+            wave_2 = [t for t in task_defs if t.depends_on]
+            if not wave_1:
+                wave_1, wave_2 = task_defs, []
+
+            # Stage 2A: Parallel execution of independent workers via `asyncio.gather`
             await asyncio.gather(
-                self._run_single_worker(
-                    task=self.tasks["TASK-1"],
-                    code_path="repo_onboard/analyzer.py",
-                    code_content=WORKER_1_ANALYZER_CODE,
-                    test_path="tests/test_analyzer.py",
-                    test_content=WORKER_1_TEST_CODE,
-                    peer_recipient="worker-tutor",
-                    schema_message=(
-                        "[SCHEMA CONTRACT] `RepoAnalyzer.analyze_target()` returns dict with keys: "
-                        "`repo_name`, `purpose_summary`, `entry_points`, `modules`, and `archify_graph` (`nodes`, `edges`)."
-                    ),
-                    demonstrate_guard_block=True,
-                ),
-                self._run_single_worker(
-                    task=self.tasks["TASK-2"],
-                    code_path="repo_onboard/onboarding_tutor.py",
-                    code_content=WORKER_2_TUTOR_CODE,
-                    test_path="tests/test_onboarding_tutor.py",
-                    test_content=WORKER_2_TEST_CODE,
-                    peer_recipient="worker-web",
-                    schema_message=(
-                        "[SCHEMA CONTRACT] `SocraticOnboardingTutor.build_onboarding_package(analysis)` "
-                        "accepts `RepoAnalyzer` output and returns `onboarding_brief` + `socratic_ladder` (3 stages)."
-                    ),
-                    demonstrate_guard_block=False,
-                ),
+                *(
+                    asyncio.to_thread(
+                        self._run_single_worker_sync,
+                        t,
+                        [w for w in all_worker_ids if w != t.assigned_to] + ["lead"],
+                    )
+                    for t in wave_1
+                )
             )
 
-            wt3_info = self.worktree_mgr.worktrees["worker-web"]
-            self.worktree_mgr._run_git(
-                ["merge", "--no-ff", "worktree-worker-analyzer", "-m", "chore: sync analyzer branch"],
-                cwd=wt3_info.worktree_path,
-            )
-            self.worktree_mgr._run_git(
-                ["merge", "--no-ff", "worktree-worker-tutor", "-m", "chore: sync tutor branch"],
-                cwd=wt3_info.worktree_path,
-            )
+            # Stage 2B: Sync upstream branches into dependent worker worktrees and run in parallel
+            if wave_2:
+                for dep_task in wave_2:
+                    dep_wt = self.worktree_mgr.worktrees[dep_task.assigned_to]
+                    for upstream_id in dep_task.depends_on:
+                        upstream_task = self.tasks.get(upstream_id)
+                        if upstream_task and upstream_task.commit_hash:
+                            self.worktree_mgr._run_git(
+                                [
+                                    "merge",
+                                    "--no-ff",
+                                    upstream_task.worktree_branch,
+                                    "-m",
+                                    f"chore: sync upstream {upstream_task.worktree_branch}",
+                                ],
+                                cwd=dep_wt.worktree_path,
+                            )
+                await asyncio.gather(
+                    *(
+                        asyncio.to_thread(
+                            self._run_single_worker_sync,
+                            t,
+                            [w for w in all_worker_ids if w != t.assigned_to] + ["lead"],
+                        )
+                        for t in wave_2
+                    )
+                )
 
-            await self._run_single_worker(
-                task=self.tasks["TASK-3"],
-                code_path="repo_onboard/service.py",
-                code_content=WORKER_3_VIEW_CODE,
-                test_path="tests/test_service.py",
-                test_content=WORKER_3_TEST_CODE,
-                peer_recipient="lead",
-                schema_message=(
-                    "[READY FOR REVIEW] Integrated `RepoAnalyzer` + `SocraticOnboardingTutor` into "
-                    "`RepoOnboardService` (`onboard_repository`, `check_socratic_answer`). All tests green."
-                ),
-                demonstrate_guard_block=False,
-            )
-
-            # Phase 3: Independent Reviewer Agent (`EvaluatorRubric`)
+            # Stage 3: Independent Reviewer Gate (`EvaluatorRubric`)
             for t in task_defs:
                 worker_id = t.assigned_to
                 wt_info = self.worktree_mgr.worktrees[worker_id]
                 diff_text = self.worktree_mgr.get_worktree_diff(worker_id)
 
-                test_file = t.target_files[1]
-                env = build_safe_subprocess_env(wt_info.worktree_path)
+                test_targets = [
+                    f for f in t.target_files if f.startswith("tests/") and f.endswith(".py")
+                ] or ["tests"]
+                env = _safe_env(wt_info.worktree_path)
                 pytest_proc = subprocess.run(
-                    [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", test_file, "-v"],
+                    [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *test_targets, "-v"],
                     cwd=str(wt_info.worktree_path),
                     env=env,
                     capture_output=True,
@@ -704,7 +849,7 @@ class MultiAgentTeamCoordinator:
                     }
                 )
 
-            # Phase 4: Lead Agent Sequential Git Merge onto `main`
+            # Stage 4: Sequential Git Merge onto `main` + Team Walkthrough Synthesis
             for t in task_defs:
                 worker_id = t.assigned_to
                 if t.status != "approved":
@@ -725,7 +870,7 @@ class MultiAgentTeamCoordinator:
                         }
                     )
 
-            main_env = build_safe_subprocess_env(self.workspace_root)
+            main_env = _safe_env(self.workspace_root)
             final_pytest = subprocess.run(
                 [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "tests", "-q"],
                 cwd=str(self.workspace_root),
@@ -734,10 +879,20 @@ class MultiAgentTeamCoordinator:
                 text=True,
                 check=False,
             )
+            integration_out = ((final_pytest.stdout or "") + (final_pytest.stderr or "")).strip()
 
-            # Push merged `main` to internal origin remote if configured
+            team_wt = _render_team_walkthrough_markdown(
+                user_goal,
+                task_defs,
+                self.handoffs,
+                final_pytest.returncode == 0,
+                integration_out,
+            )
+            self.team_artifacts["walkthrough"] = team_wt
+            (self.abyss_dir / "team_walkthrough.md").write_text(team_wt, encoding="utf-8")
+
             remote_info = self.worktree_mgr.get_remote_info()
-            if remote_info["configured"]:
+            if remote_info["configured"] and self.merge_results:
                 self.last_push_result = await asyncio.to_thread(
                     self.worktree_mgr.push_branch,
                     self.worktree_mgr.get_default_branch(),
@@ -752,7 +907,7 @@ class MultiAgentTeamCoordinator:
                     "role": "lead",
                     "event_type": "workflow_finished",
                     "all_merged": all(t.status == "merged" for t in self.tasks.values()),
-                    "integration_pytest_output": (final_pytest.stdout or "").strip(),
+                    "integration_pytest_output": integration_out,
                 }
             )
             return self.get_dashboard_state()
@@ -766,7 +921,11 @@ class MultiAgentTeamCoordinator:
         status = (
             "running"
             if self.is_running
-            else ("completed" if (self.last_status == "completed" or self.merge_results) else self.last_status)
+            else (
+                "completed"
+                if (self.last_status == "completed" or self.merge_results)
+                else self.last_status
+            )
         )
         merged_branches = [m["branch"] for m in self.merge_results if m.get("merged")]
         remote_info = self.worktree_mgr.get_remote_info()
@@ -774,10 +933,12 @@ class MultiAgentTeamCoordinator:
             remote_info = {**remote_info, "last_push": self.last_push_result}
 
         return {
+            "engine": "langchain-ai/deepagents",
             "status": status,
             "is_running": self.is_running,
-            "engine_mode": self.engine_mode,
             "workspace_root": str(self.workspace_root),
+            "lead_todos": list(self.lead_todos),
+            "team_artifacts": dict(self.team_artifacts),
             "tasks": [t.to_dict() for t in self.tasks.values()],
             "worktrees": {
                 wid: info.to_dict() for wid, info in self.worktree_mgr.worktrees.items()
@@ -790,11 +951,5 @@ class MultiAgentTeamCoordinator:
             "internal_remote": remote_info,
             "git_graph": self.worktree_mgr.get_git_graph_log(limit=18),
             "rotator": self.rotator.get_state(),
-            "deepagents_preview": create_worktree_deep_agent(
-                rotator=self.rotator,
-                agent_id="worker-analyzer",
-                role="worker-analyzer",
-                worktree_root=self.workspace_root / ".abyss" / "worktrees" / "worker-analyzer",
-            ),
             "recent_events": self.event_stream[-60:],
         }

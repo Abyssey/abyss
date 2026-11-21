@@ -12,7 +12,6 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 class WorkflowTriggerPayload(BaseModel):
     goal: str = "Build RepoOnboard: Local & Internal Git Codebase Onboarding Service"
-    engine_mode: str = "agent_runtime"
 
 
 class BuildTaskRequest(BaseModel):
